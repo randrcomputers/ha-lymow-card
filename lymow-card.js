@@ -81,6 +81,74 @@
     return st?.state === "on";
   }
 
+  function normalizeDeviceId(value) {
+    if (!value) return null;
+    if (typeof value === "string") {
+      const s = value.trim();
+      return s || null;
+    }
+    if (typeof value === "object") {
+      return value.device_id || value.id || null;
+    }
+    return null;
+  }
+
+  function isBatteryThresholdEntity(uid, friendlyName) {
+    const uidLower = String(uid || "").toLowerCase();
+    const nameLower = String(friendlyName || "").toLowerCase();
+    return (
+      uidLower.endsWith("_auto_recharge_battery") ||
+      uidLower.endsWith("_auto_resume_battery") ||
+      nameLower.includes("auto recharge battery") ||
+      nameLower.includes("auto resume battery")
+    );
+  }
+
+  function scoreBatteryCandidate(hass, eid, ent) {
+    const st = entityState(hass, eid);
+    if (!st) return -1;
+    const uid = ent.unique_id || "";
+    const name = st.attributes?.friendly_name || "";
+    if (isBatteryThresholdEntity(uid, name)) return -1;
+
+    let score = 0;
+    if (st.attributes?.device_class === "battery") score += 100;
+    if (name.toLowerCase() === "battery") score += 80;
+    if (String(uid).endsWith("_battery")) score += 60;
+    if (st.attributes?.unit_of_measurement === "%") score += 20;
+    const level = parseNumericState(hass, eid);
+    if (level != null && level >= 0 && level <= 100) score += 50;
+    return score;
+  }
+
+  function findBatteryOnDevice(hass, deviceId) {
+    if (!deviceId) return null;
+    let best = null;
+    let bestScore = 0;
+    for (const [eid, ent] of Object.entries(hass.entities || {})) {
+      if (ent.device_id !== deviceId) continue;
+      if (entityDomain(eid) !== "sensor") continue;
+      const score = scoreBatteryCandidate(hass, eid, ent);
+      if (score > bestScore) {
+        bestScore = score;
+        best = eid;
+      }
+    }
+    return best;
+  }
+
+  function resolveBatteryEntity(hass, config, merged, deviceId) {
+    const manual = normalizeEntityId(config.entity_battery);
+    const candidates = [manual, merged.battery, findBatteryOnDevice(hass, deviceId)].filter(Boolean);
+    const seen = new Set();
+    for (const eid of candidates) {
+      if (seen.has(eid)) continue;
+      seen.add(eid);
+      if (parseNumericState(hass, eid) != null) return eid;
+    }
+    return manual || merged.battery || findBatteryOnDevice(hass, deviceId);
+  }
+
   function normalizeEntityId(value) {
     if (!value) return null;
     if (typeof value === "string") {
@@ -121,6 +189,14 @@
       const n = Number(attrs[key]);
       if (Number.isFinite(n)) return n;
     }
+    if (typeof hass?.formatEntityState === "function") {
+      const formatted = String(hass.formatEntityState(st, entityId) || "");
+      const fm = formatted.match(/(-?\d+(?:\.\d+)?)\s*%/);
+      if (fm) {
+        const parsed = Number(fm[1]);
+        if (Number.isFinite(parsed)) return parsed;
+      }
+    }
     return null;
   }
 
@@ -156,9 +232,13 @@
       btn_dock_cancel: normalizeEntityId(config.entity_btn_dock_cancel),
     };
 
-    if (!config.device) return manual;
+    if (!config.device) {
+      const out = { ...manual };
+      out.battery = resolveBatteryEntity(hass, config, out, null);
+      return out;
+    }
 
-    const devId = config.device;
+    const devId = normalizeDeviceId(config.device);
     const found = Object.fromEntries(Object.keys(ENTITY_SUFFIXES).map((k) => [k, null]));
     const registry = hass.entities || {};
 
@@ -186,6 +266,7 @@
       if (value) merged[key] = value;
     }
     merged.mower = manual.mower || found.mower;
+    merged.battery = resolveBatteryEntity(hass, config, merged, devId);
     return merged;
   }
 
@@ -287,16 +368,37 @@
     return /^[A-Za-z0-9_-]{6,}$/.test(s) && !/\s/.test(s);
   }
 
+  function zoneDisplayName(props, id, index) {
+    const candidates = [
+      props.displayName,
+      props.label,
+      props.zoneName,
+      props.zone_name,
+      props.title,
+      props.name,
+    ]
+      .filter((v) => v != null && String(v).trim())
+      .map((v) => String(v).trim());
+
+    for (const raw of candidates) {
+      if (raw === id || isHashLike(raw)) continue;
+      const zoneNum = raw.match(/^zone\s*(\d+)$/i);
+      if (zoneNum) return `Zone ${zoneNum[1]}`;
+      return raw;
+    }
+    return `Zone ${index + 1}`;
+  }
+
   /** Zone list from Map GeoJSON sensor (Lymow-HA). */
   function loadZones(hass, entityId) {
     const st = entityState(hass, entityId);
     if (!st?.attributes) return [];
     const attrs = st.attributes;
     let features = [];
-    if (attrs.geojson?.features) {
-      features = attrs.geojson.features;
-    } else if (attrs.geojson_zones?.features) {
+    if (attrs.geojson_zones?.features) {
       features = attrs.geojson_zones.features;
+    } else if (attrs.geojson?.features) {
+      features = attrs.geojson.features;
     }
     const zones = [];
     const seen = new Set();
@@ -306,13 +408,16 @@
       const id = p.hashId || p.hash_id || p.id;
       if (!id || seen.has(id)) continue;
       seen.add(id);
-      let name = p.name ? String(p.name) : String(id);
-      if (!p.name && isHashLike(name)) {
-        name = `Zone ${zones.length + 1}`;
-      }
-      zones.push({ id: String(id), name });
+      const index = zones.length;
+      const name = zoneDisplayName(p, String(id), index);
+      zones.push({ id: String(id), name, index });
     }
-    zones.sort((a, b) => a.name.localeCompare(b.name));
+    zones.sort((a, b) => {
+      const na = a.name.match(/^Zone\s+(\d+)$/i);
+      const nb = b.name.match(/^Zone\s+(\d+)$/i);
+      if (na && nb) return Number(na[1]) - Number(nb[1]);
+      return a.index - b.index;
+    });
     return zones;
   }
 
@@ -470,10 +575,7 @@
       try {
         if (useZones) {
           const payload = {
-            zones: [...selected].map((id) => {
-              const z = zones.find((x) => x.id === id);
-              return z?.name || id;
-            }),
+            zones: [...selected],
           };
           if (cfg.device) payload.device_id = cfg.device;
           await this._call("lymow", "start_zones", payload);
