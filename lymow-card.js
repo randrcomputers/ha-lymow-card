@@ -54,7 +54,22 @@
     // UI editor saves empty strings — do not wipe bundled default paths.
     if (!String(c.image_mower || "").trim()) c.image_mower = DEFAULTS.image_mower;
     if (!String(c.image_dock || "").trim()) c.image_dock = DEFAULTS.image_dock;
+    c.hero_mode = normalizeHeroMode(c.hero_mode);
+    c.show_map = cfgBool(c.show_map, DEFAULTS.show_map);
     return c;
+  }
+
+  function normalizeHeroMode(value) {
+    const raw = String(value ?? "auto").trim().toLowerCase();
+    if (raw === "map" || raw === "art" || raw === "auto") return raw;
+    return "auto";
+  }
+
+  function cfgBool(value, defaultValue = true) {
+    if (value === undefined || value === null) return defaultValue;
+    if (typeof value === "boolean") return value;
+    if (typeof value === "string") return !/^(false|0|off|no)$/i.test(value.trim());
+    return Boolean(value);
   }
 
   /** Resolve /local/ and relative paths for Lovelace + mobile apps. */
@@ -323,22 +338,26 @@
   }
 
   function showMapHero(cfg, activity) {
-    if (!cfg.show_map || cfg.hero_mode === "art") return false;
-    if (cfg.hero_mode === "map") return true;
+    const mode = normalizeHeroMode(cfg.hero_mode);
+    if (mode === "art") return false;
+    if (mode === "map") return true;
+    if (!cfgBool(cfg.show_map, true)) return false;
     return isActiveRun(activity);
   }
 
   function showArtHero(cfg, activity) {
-    if (cfg.hero_mode === "art") return true;
-    if (cfg.hero_mode === "map") return false;
+    const mode = normalizeHeroMode(cfg.hero_mode);
+    if (mode === "art") return true;
+    if (mode === "map") return false;
     return !isActiveRun(activity);
   }
 
-  /** Art when docked in auto, always in art mode, or as map fallback. */
-  function shouldShowArt(cfg, activity, mapFailed, hasMap) {
-    if (showArtHero(cfg, activity)) return true;
-    if (cfg.hero_mode === "map" && (mapFailed || !hasMap)) return true;
-    return false;
+  /** Art in auto (docked) and art mode; map mode only if no map camera entity. */
+  function shouldShowArt(cfg, activity, hasMap) {
+    const mode = normalizeHeroMode(cfg.hero_mode);
+    if (mode === "art") return true;
+    if (mode === "map") return !hasMap;
+    return !isActiveRun(activity);
   }
 
   function heroArtPath(cfg, activity) {
@@ -786,9 +805,11 @@
     }
 
     _renderHero(cfg, entities, activity, phase) {
+      const mode = normalizeHeroMode(cfg.hero_mode);
+      const mapAllowed = showMapHero(cfg, activity) && entities.map;
       const mapOn =
-        showMapHero(cfg, activity) && entities.map && !this._mapFailed;
-      const artOn = shouldShowArt(cfg, activity, this._mapFailed, Boolean(entities.map));
+        mapAllowed && (mode === "map" || !this._mapFailed);
+      const artOn = shouldShowArt(cfg, activity, Boolean(entities.map));
       const img = heroArtPath(cfg, activity);
       const artSrc = mediaUrl(this.hass, img);
 
@@ -834,6 +855,8 @@
     }
 
     _onMapError() {
+      const mode = normalizeHeroMode(mergeConfig(this.config).hero_mode);
+      if (mode === "map") return;
       this._mapFailed = true;
     }
 
@@ -1408,9 +1431,16 @@
     }
 
     _changed(ev) {
+      const value = ev.detail.value || {};
       this.dispatchEvent(
         new CustomEvent("config-changed", {
-          detail: { config: ev.detail.value },
+          detail: {
+            config: {
+              type: "custom:lymow-card",
+              ...value,
+              hero_mode: normalizeHeroMode(value.hero_mode),
+            },
+          },
         })
       );
     }
@@ -1481,7 +1511,7 @@
               entity_btn_dock_cancel: "Dock & cancel button",
               name: "Card title override",
               hero_mode: "Hero area layout",
-              show_map: "Enable map camera in hero",
+              show_map: "Auto mode only — show map while mowing",
               show_stats: "Show stats row (area, height, RTK)",
               show_mow_mode: "Show mow pattern selector",
               show_zone_picker: "Show zone picker (Start selected zones)",
