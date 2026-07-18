@@ -982,9 +982,10 @@
 
     _renderHero(cfg, entities, activity, phase) {
       const mode = normalizeHeroMode(cfg.hero_mode);
-      const mapAllowed = showMapHero(cfg, activity) && entities.map;
       const mapOn =
-        mapAllowed && (mode === "map" || !this._mapFailed);
+        showMapHero(cfg, activity) &&
+        entities.map &&
+        (mode === "map" || !this._mapFailed);
       const artOn = shouldShowArt(cfg, activity, Boolean(entities.map));
       const img = heroArtPath(cfg, activity);
       const artSrc = mediaUrl(this.hass, img);
@@ -997,7 +998,14 @@
         projection;
       const artFailed = Boolean(artSrc && this._artFailedSrc === artSrc);
 
-      if (mapOn) {
+      // Prefer live map (+ zone overlay) whenever the map camera exists.
+      const useLiveMap =
+        entities.map &&
+        (mapOn || highlightZones || mode === "map" || artFailed) &&
+        (mode !== "art" || highlightZones) &&
+        (mode === "map" || highlightZones || !this._mapFailed);
+
+      if (useLiveMap) {
         return this._renderMapHero(
           entities,
           phase,
@@ -1006,10 +1014,6 @@
           projection,
           highlightZones
         );
-      }
-
-      if (highlightZones) {
-        return this._renderGeoJsonHero(zoneFeatures, selected, phase, projection);
       }
 
       if (artOn && artSrc && !artFailed) {
@@ -1028,23 +1032,8 @@
         `;
       }
 
-      // No SVG placeholder — fall back to live map, then zone schematic, then empty.
-      if (
-        entities.map &&
-        mode !== "art" &&
-        (mode === "map" || artFailed || !this._mapFailed)
-      ) {
-        return this._renderMapHero(
-          entities,
-          phase,
-          zoneFeatures,
-          selected,
-          projection,
-          highlightZones
-        );
-      }
-
-      if (zoneFeatures.length && projection) {
+      // GeoJSON schematic only when there is no map camera at all.
+      if (!entities.map && zoneFeatures.length && projection) {
         return this._renderGeoJsonHero(zoneFeatures, selected, phase, projection);
       }
 
