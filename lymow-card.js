@@ -48,7 +48,21 @@
   };
 
   function mergeConfig(config) {
-    return { ...DEFAULTS, ...config };
+    const c = { ...DEFAULTS, ...(config || {}) };
+    // UI editor saves empty strings — do not wipe bundled default paths.
+    if (!String(c.image_mower || "").trim()) c.image_mower = DEFAULTS.image_mower;
+    if (!String(c.image_dock || "").trim()) c.image_dock = DEFAULTS.image_dock;
+    return c;
+  }
+
+  /** Resolve /local/ and relative paths for Lovelace + mobile apps. */
+  function mediaUrl(hass, path) {
+    if (!path) return "";
+    const p = String(path);
+    if (/^(https?:|data:|\/api\/)/i.test(p)) return p;
+    if (typeof hass?.hassUrl === "function") return hass.hassUrl(p);
+    const base = String(hass?.url || "").replace(/\/$/, "");
+    return base ? `${base}${p.startsWith("/") ? p : `/${p}`}` : p;
   }
 
   function entityState(hass, entityId) {
@@ -217,6 +231,7 @@
         _busy: { state: false },
         _pending: { state: null },
         _mapTick: { state: 0 },
+        _mapFailed: { state: false },
       };
     }
 
@@ -256,6 +271,14 @@
       if (changed.has("config")) {
         this._stopMapTimer();
         this._startMapTimer();
+        this._mapFailed = false;
+      }
+      if (changed.has("hass") && this._mapFailed) {
+        const entities = resolveEntities(this.hass, mergeConfig(this.config));
+        const activity = mowerActivity(this.hass, entities);
+        if (!showMapHero(mergeConfig(this.config), activity)) {
+          this._mapFailed = false;
+        }
       }
       if (this._pending && changed.has("hass")) {
         this._clearPendingIfDone();
@@ -420,31 +443,43 @@
     }
 
     _renderHero(cfg, entities, activity, phase) {
-      const mapOn = showMapHero(cfg, activity);
+      const mapOn =
+        showMapHero(cfg, activity) && entities.map && !this._mapFailed;
       const artOn = showArtHero(cfg, activity);
 
-      if (mapOn && entities.map) {
+      const img =
+        activity === "mowing" || activity === "returning" || activity === "paused"
+          ? cfg.image_mower
+          : cfg.image_dock || cfg.image_mower;
+      const artSrc = mediaUrl(this.hass, img);
+
+      if (mapOn) {
         const st = entityState(this.hass, entities.map);
         const token = st?.attributes?.access_token || "";
         const src = cameraProxyUrl(this.hass, entities.map, token);
         void this._mapTick;
         return html`
           <div class="hero map-hero ${phase}">
-            <img src=${src} alt="Lymow map" draggable="false" @error=${this._onMapError} />
+            <img
+              src=${src}
+              alt="Lymow map"
+              draggable="false"
+              @error=${this._onMapError}
+            />
             <div class="map-badge">Live map</div>
           </div>
         `;
       }
 
-      const img =
-        activity === "mowing" || activity === "returning" || activity === "paused"
-          ? cfg.image_mower
-          : cfg.image_dock || cfg.image_mower;
-
-      if (artOn && img) {
+      if (artOn && artSrc) {
         return html`
           <div class="hero art-hero ${phase}">
-            <img src=${img} alt="" draggable="false" />
+            <img
+              src=${artSrc}
+              alt=""
+              draggable="false"
+              @error=${(ev) => this._onArtError(ev, artSrc)}
+            />
           </div>
         `;
       }
@@ -456,8 +491,24 @@
       `;
     }
 
-    _onMapError(ev) {
-      ev.target.style.display = "none";
+    _onMapError() {
+      this._mapFailed = true;
+    }
+
+    _onArtError(ev, src) {
+      const el = ev.target;
+      if (el?.dataset?.fallbackTried) {
+        el.style.display = "none";
+        return;
+      }
+      // Retry once without hassUrl in case of double-prefix edge cases.
+      const raw = String(src || "").replace(/^https?:\/\/[^/]+/i, "");
+      if (raw && raw !== src) {
+        el.dataset.fallbackTried = "1";
+        el.src = raw;
+        return;
+      }
+      el.style.display = "none";
     }
 
     _mowerSvg(phase) {

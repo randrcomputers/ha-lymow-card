@@ -85,6 +85,32 @@ See `examples/dashboard-card.yaml` for a full snippet.
 
 Copy photos to `config/www/lymow_card/` and set URLs in the editor. Details in [`lymow_card/README.md`](lymow_card/README.md).
 
+## Troubleshooting
+
+### Artwork not showing
+
+1. **Copy PNGs to HA** — HACS only installs `lymow-card.js`. You must copy `lymow_card/` to `config/www/lymow_card/` (same as your File Editor path `homeassistant/www/lymow_card/`).
+
+2. **Set paths in the card** (or rely on defaults after card v1.0.1+):
+
+```yaml
+type: custom:lymow-card
+device: YOUR_DEVICE_ID
+hero_mode: art
+image_dock: /local/lymow_card/lymow_docked.png
+image_mower: /local/lymow_card/lymow_dock_empty.png
+```
+
+3. **Verify in browser** — open `https://YOUR-HA:8123/local/lymow_card/lymow_docked.png` while logged in. If that 404s, the files are not in `www/`.
+
+4. **Reload the card** — **Settings → Dashboards → Resources → Reload**, then **Ctrl+F5**.
+
+5. **`hero_mode: auto`** shows the **map camera** while mowing (not the PNGs). Use `hero_mode: art` to always use dock artwork.
+
+### Map hero blank but docked art works
+
+The integration **Map** camera may be empty on first poll. The card falls back to PNG artwork when the map fails to load.
+
 ## Requirements
 
 - Home Assistant **2024.1+**
