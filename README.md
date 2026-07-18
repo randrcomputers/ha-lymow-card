@@ -8,7 +8,7 @@ Replaces generic cards like [compact-lawn-mower-card](https://github.com/Tra1n84
 
 - **Lymow device picker** — auto-fills mower, status, battery, map camera, buttons, and more
 - **Live map hero** — integration map camera while mowing / returning (refreshes on an interval)
-- **Custom artwork** — transparent generic dock / empty-dock cutouts (no outdoor background)
+- **Custom artwork** — transparent generic dock / empty-dock cutouts
 - **Built-in silhouette** — Lymow-style SVG fallback when no images are configured
 - **Battery + online** — compact header with charging state
 - **Session progress bar** — uses `Session Progress` sensor during active runs
