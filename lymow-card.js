@@ -437,10 +437,55 @@
     return `Zone ${index + 1}`;
   }
 
-  /** Zone polygons from Map GeoJSON sensor (Lymow-HA). */
-  function loadZoneFeatures(hass, entityId) {
+  const WGS84_A = 6378137;
+
+  /** Match Lymow-HA build_map_png: uniform scale, PAD, Y-flip. */
+  function lymowMapProjection(renderDebug, ringBounds) {
+    const W = 100;
+    const H = 100;
+    const PAD = 5;
+    const min_x = renderDebug?.min_x ?? ringBounds?.minX;
+    const max_x = renderDebug?.max_x ?? ringBounds?.maxX;
+    const min_y = renderDebug?.min_y ?? ringBounds?.minY;
+    const max_y = renderDebug?.max_y ?? ringBounds?.maxY;
+    if (![min_x, max_x, min_y, max_y].every(Number.isFinite)) return null;
+    const scale = (W - PAD * 2) / Math.max(max_x - min_x || 1, max_y - min_y || 1);
+    return {
+      toPoints(ring) {
+        return ring
+          .map(([x, y]) => {
+            const nx = (x - min_x) * scale + PAD;
+            const ny = H - ((y - min_y) * scale + PAD);
+            return `${nx.toFixed(2)},${ny.toFixed(2)}`;
+          })
+          .join(" ");
+      },
+    };
+  }
+
+  function latLonRingToEnu(ring, lat0, lon0) {
+    const latRad = (lat0 * Math.PI) / 180;
+    return ring.map(([lon, lat]) => {
+      const north_m = ((lat - lat0) * Math.PI) / 180 * WGS84_A;
+      const east_m = ((lon - lon0) * Math.PI) / 180 * WGS84_A * Math.cos(latRad);
+      return [north_m, east_m];
+    });
+  }
+
+  function ringCoordMode(feature) {
+    const crs = feature?.geometry?._crs || feature?.properties?._crs;
+    if (crs === "ENU_metres") return "enu";
+    return "wgs84";
+  }
+
+  /** Zone polygons aligned to Lymow map camera (ENU + render_debug). */
+  function loadZoneFeatures(hass, entityId, mapEntityId) {
     const st = entityState(hass, entityId);
-    if (!st?.attributes) return [];
+    if (!st?.attributes) return { zones: [], projection: null };
+
+    const mapSt = mapEntityId ? entityState(hass, mapEntityId) : null;
+    const renderDebug = mapSt?.attributes?.render_debug || null;
+
     const attrs = st.attributes;
     let features = [];
     if (attrs.geojson_zones?.features) {
@@ -448,6 +493,13 @@
     } else if (attrs.geojson?.features) {
       features = attrs.geojson.features;
     }
+
+    const ebp = attrs.enu_base_point || {};
+    const lat0 = Number(ebp.latitude);
+    const lon0 = Number(ebp.longitude);
+    const hasOrigin =
+      attrs.has_gps_origin && Number.isFinite(lat0) && Number.isFinite(lon0);
+
     const zones = [];
     const seen = new Set();
     for (const f of features) {
@@ -457,22 +509,31 @@
       if (!id || seen.has(id)) continue;
       const geom = f.geometry;
       if (!geom || geom.type !== "Polygon" || !geom.coordinates?.[0]?.length) continue;
-      const ring = geom.coordinates[0]
+
+      let ring = geom.coordinates[0]
         .map((pt) => [Number(pt[0]), Number(pt[1])])
         .filter((pt) => Number.isFinite(pt[0]) && Number.isFinite(pt[1]));
       if (ring.length < 3) continue;
+
+      if (hasOrigin && ringCoordMode(f) !== "enu") {
+        ring = latLonRingToEnu(ring, lat0, lon0);
+      }
+
       seen.add(id);
       const index = zones.length;
       const name = zoneDisplayName(p, String(id), index);
       zones.push({ id: String(id), name, index, ring });
     }
+
     zones.sort((a, b) => {
       const na = a.name.match(/^Zone\s+(\d+)$/i);
       const nb = b.name.match(/^Zone\s+(\d+)$/i);
       if (na && nb) return Number(na[1]) - Number(nb[1]);
       return a.index - b.index;
     });
-    return zones;
+
+    const projection = lymowMapProjection(renderDebug, zoneFeatureBounds(zones));
+    return { zones, projection };
   }
 
   function zoneFeatureBounds(zoneFeatures) {
@@ -494,21 +555,9 @@
     return { minX, minY, width, height, pad: 4 };
   }
 
-  function ringToSvgPoints(ring, bounds) {
-    const { minX, minY, width, height, pad } = bounds;
-    const inner = 100 - pad * 2;
-    return ring
-      .map(([x, y]) => {
-        const nx = pad + ((x - minX) / width) * inner;
-        const ny = pad + (1 - (y - minY) / height) * inner;
-        return `${nx.toFixed(2)},${ny.toFixed(2)}`;
-      })
-      .join(" ");
-  }
-
   /** Zone list from Map GeoJSON sensor (Lymow-HA). */
-  function loadZones(hass, entityId) {
-    return loadZoneFeatures(hass, entityId).map(({ id, name, index }) => ({
+  function loadZones(hass, entityId, mapEntityId) {
+    return loadZoneFeatures(hass, entityId, mapEntityId).zones.map(({ id, name, index }) => ({
       id,
       name,
       index,
@@ -552,7 +601,11 @@
       if (cfg.show_secondary_actions) size += 1;
       if (cfg.show_zone_picker !== false && this.hass) {
         const entities = resolveEntities(this.hass, cfg);
-        const zones = loadZones(this.hass, cfg.entity_map_geojson || entities.map_geojson);
+        const zones = loadZones(
+          this.hass,
+          cfg.entity_map_geojson || entities.map_geojson,
+          entities.map
+        );
         if (zones.length > 0) size += 2;
       }
       return size;
@@ -564,7 +617,19 @@
     }
 
     _zoneList(cfg, entities) {
-      return loadZones(this.hass, cfg.entity_map_geojson || entities.map_geojson);
+      return loadZones(
+        this.hass,
+        cfg.entity_map_geojson || entities.map_geojson,
+        entities.map
+      );
+    }
+
+    _zoneFeatureData(cfg, entities) {
+      return loadZoneFeatures(
+        this.hass,
+        cfg.entity_map_geojson || entities.map_geojson,
+        entities.map
+      );
     }
 
     _selectedZoneSet() {
@@ -850,44 +915,67 @@
       `;
     }
 
-    _renderZoneHighlightSvg(zoneFeatures, selected) {
-      if (!selected?.size || !zoneFeatures?.length) return nothing;
-      const bounds = zoneFeatureBounds(zoneFeatures);
-      if (!bounds) return nothing;
+    _renderZoneHighlightSvg(zoneFeatures, selected, projection) {
+      if (!selected?.size || !zoneFeatures?.length || !projection) return nothing;
+      const picked = zoneFeatures.filter((z) => selected.has(z.id));
+      if (!picked.length) return nothing;
       return html`
         <svg class="zone-overlay" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
-          ${zoneFeatures.map((z) => {
-            const on = selected.has(z.id);
-            const pts = ringToSvgPoints(z.ring, bounds);
+          ${picked.map((z) => {
+            const pts = projection.toPoints(z.ring);
             return html`
-              <polygon
-                points=${pts}
-                class=${on ? "selected" : "dimmed"}
-              ></polygon>
+              <polygon points=${pts} class="selected-glow"></polygon>
+              <polygon points=${pts} class="selected"></polygon>
             `;
           })}
         </svg>
       `;
     }
 
-    _renderGeoJsonHero(zoneFeatures, selected, phase) {
-      const bounds = zoneFeatureBounds(zoneFeatures);
-      if (!bounds) return nothing;
+    _renderGeoJsonHero(zoneFeatures, selected, phase, projection) {
+      const proj =
+        projection ||
+        lymowMapProjection(null, zoneFeatureBounds(zoneFeatures));
+      if (!proj) return nothing;
+      const hasSelection = selected?.size > 0;
       return html`
         <div class="hero geo-hero ${phase}">
           <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
             ${zoneFeatures.map((z) => {
-              const on = !selected?.size || selected.has(z.id);
-              const pts = ringToSvgPoints(z.ring, bounds);
+              const on = !hasSelection || selected.has(z.id);
+              const pts = proj.toPoints(z.ring);
               return html`
                 <polygon
                   points=${pts}
-                  class=${on && selected?.size ? "selected" : selected?.size ? "dimmed" : "idle"}
+                  class=${on && hasSelection ? "selected" : hasSelection ? "dimmed" : "idle"}
                 ></polygon>
               `;
             })}
           </svg>
           <div class="map-badge">Zone map</div>
+        </div>
+      `;
+    }
+
+    _renderMapHero(entities, phase, zoneFeatures, selected, projection, highlightZones) {
+      const st = entityState(this.hass, entities.map);
+      const token = st?.attributes?.access_token || "";
+      const src = cameraProxyUrl(this.hass, entities.map, token);
+      void this._mapTick;
+      return html`
+        <div class="hero map-hero ${phase}">
+          <div class="map-stack">
+            <img
+              src=${src}
+              alt="Lymow map"
+              draggable="false"
+              @error=${this._onMapError}
+            />
+            ${highlightZones
+              ? this._renderZoneHighlightSvg(zoneFeatures, selected, projection)
+              : nothing}
+          </div>
+          <div class="map-badge">Live map</div>
         </div>
       `;
     }
@@ -901,43 +989,30 @@
       const img = heroArtPath(cfg, activity);
       const artSrc = mediaUrl(this.hass, img);
       const selected = this._selectedZoneSet();
-      const zoneFeatures = loadZoneFeatures(
-        this.hass,
-        cfg.entity_map_geojson || entities.map_geojson
-      );
+      const { zones: zoneFeatures, projection } = this._zoneFeatureData(cfg, entities);
       const highlightZones =
         cfg.show_zone_picker !== false &&
         selected.size > 0 &&
-        zoneFeatures.length > 0;
+        zoneFeatures.length > 0 &&
+        projection;
+      const artFailed = Boolean(artSrc && this._artFailedSrc === artSrc);
 
       if (mapOn) {
-        const st = entityState(this.hass, entities.map);
-        const token = st?.attributes?.access_token || "";
-        const src = cameraProxyUrl(this.hass, entities.map, token);
-        void this._mapTick;
-        return html`
-          <div class="hero map-hero ${phase}">
-            <div class="map-stack">
-              <img
-                src=${src}
-                alt="Lymow map"
-                draggable="false"
-                @error=${this._onMapError}
-              />
-              ${highlightZones
-                ? this._renderZoneHighlightSvg(zoneFeatures, selected)
-                : nothing}
-            </div>
-            <div class="map-badge">Live map</div>
-          </div>
-        `;
+        return this._renderMapHero(
+          entities,
+          phase,
+          zoneFeatures,
+          selected,
+          projection,
+          highlightZones
+        );
       }
 
       if (highlightZones) {
-        return this._renderGeoJsonHero(zoneFeatures, selected, phase);
+        return this._renderGeoJsonHero(zoneFeatures, selected, phase, projection);
       }
 
-      if (artOn && artSrc && this._artFailedSrc !== artSrc) {
+      if (artOn && artSrc && !artFailed) {
         return html`
           <div class="hero art-hero ${phase}">
             <img
@@ -953,11 +1028,27 @@
         `;
       }
 
-      return html`
-        <div class="hero svg-hero ${phase}">
-          ${this._mowerSvg(phase)}
-        </div>
-      `;
+      // No SVG placeholder — fall back to live map, then zone schematic, then empty.
+      if (
+        entities.map &&
+        mode !== "art" &&
+        (mode === "map" || artFailed || !this._mapFailed)
+      ) {
+        return this._renderMapHero(
+          entities,
+          phase,
+          zoneFeatures,
+          selected,
+          projection,
+          highlightZones
+        );
+      }
+
+      if (zoneFeatures.length && projection) {
+        return this._renderGeoJsonHero(zoneFeatures, selected, phase, projection);
+      }
+
+      return html`<div class="hero empty-hero ${phase}"></div>`;
     }
 
     _onMapError() {
@@ -979,21 +1070,6 @@
         }
       }
       this._artFailedSrc = src;
-    }
-
-    _mowerSvg(phase) {
-      const accent = phase === "error" ? "#ef4444" : phase === "mowing" ? "#22c55e" : "#f97316";
-      return html`
-        <svg class="mower-svg" viewBox="0 0 240 140" aria-hidden="true">
-          <ellipse cx="120" cy="118" rx="72" ry="10" fill="rgba(0,0,0,0.18)" />
-          <rect x="52" y="48" width="136" height="58" rx="18" fill="#111827" stroke="${accent}" stroke-width="3" />
-          <rect x="68" y="58" width="104" height="18" rx="6" fill="#1f2937" />
-          <circle cx="82" cy="112" r="16" fill="#0f172a" stroke="#374151" stroke-width="3" />
-          <circle cx="158" cy="112" r="16" fill="#0f172a" stroke="#374151" stroke-width="3" />
-          <rect x="108" y="34" width="24" height="18" rx="4" fill="${accent}" opacity="0.9" />
-          <path d="M96 48 L120 28 L144 48" fill="none" stroke="${accent}" stroke-width="2.5" stroke-linecap="round" />
-        </svg>
-      `;
     }
 
     _onlineIcon(on) {
@@ -1252,36 +1328,42 @@
           border-radius: 8px;
         }
         .map-stack {
-          position: relative;
-          width: 100%;
-          display: flex;
-          align-items: center;
-          justify-content: center;
-        }
-        .map-stack img {
+          display: grid;
           width: 100%;
           max-height: 160px;
+          place-items: center;
+        }
+        .map-stack > img,
+        .map-stack > svg {
+          grid-area: 1 / 1;
+          width: 100%;
+          max-height: 160px;
+        }
+        .map-stack img {
           object-fit: contain;
           display: block;
           border-radius: 8px;
+          z-index: 1;
         }
         .zone-overlay {
-          position: absolute;
-          inset: 0;
-          width: 100%;
-          height: 100%;
+          z-index: 2;
           pointer-events: none;
+          overflow: visible;
         }
-        .zone-overlay .selected,
-        .geo-hero .selected {
-          fill: rgba(74, 222, 128, 0.45);
-          stroke: #4ade80;
-          stroke-width: 0.75;
+        .zone-overlay .selected-glow {
+          fill: rgba(250, 204, 21, 0.25);
+          stroke: rgba(254, 240, 138, 0.9);
+          stroke-width: 3;
+        }
+        .zone-overlay .selected {
+          fill: rgba(250, 204, 21, 0.5);
+          stroke: #fff;
+          stroke-width: 1.4;
         }
         .zone-overlay .dimmed,
         .geo-hero .dimmed {
-          fill: rgba(0, 0, 0, 0.28);
-          stroke: rgba(255, 255, 255, 0.12);
+          fill: rgba(0, 0, 0, 0.22);
+          stroke: rgba(255, 255, 255, 0.1);
           stroke-width: 0.35;
         }
         .geo-hero {
@@ -1291,6 +1373,11 @@
           width: 100%;
           max-height: 160px;
           display: block;
+        }
+        .geo-hero .selected {
+          fill: rgba(250, 204, 21, 0.5);
+          stroke: #fef9c3;
+          stroke-width: 1.4;
         }
         .geo-hero .idle {
           fill: rgba(34, 197, 94, 0.22);
@@ -1308,9 +1395,8 @@
           background: rgba(0, 0, 0, 0.55);
           color: #bbf7d0;
         }
-        .mower-svg {
-          width: min(220px, 90%);
-          height: auto;
+        .empty-hero {
+          min-height: 130px;
         }
         .phase-mowing .hero {
           box-shadow: inset 0 0 0 1px rgba(34, 197, 94, 0.25);
