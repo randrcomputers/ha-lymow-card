@@ -331,13 +331,28 @@
     return !showMapHero(cfg, activity);
   }
 
+  function batteryEntityFromMower(mowerEntityId) {
+    if (!mowerEntityId || !String(mowerEntityId).includes(".")) return null;
+    const slug = String(mowerEntityId).split(".").slice(1).join(".");
+    return slug ? `sensor.${slug}_battery` : null;
+  }
+
   function batteryLevel(hass, entities) {
-    const fromSensor = parseNumericState(hass, entities.battery);
+    const entityId =
+      typeof entities === "string"
+        ? entities
+        : entities?.battery || batteryEntityFromMower(entities?.mower);
+    const fromSensor = parseNumericState(hass, entityId);
     if (fromSensor != null) return fromSensor;
-    const mower = entityState(hass, entities.mower);
+    const mower = entityState(hass, typeof entities === "object" ? entities?.mower : null);
     if (mower?.attributes?.battery_level != null) {
       const n = Number(mower.attributes.battery_level);
       if (Number.isFinite(n)) return n;
+    }
+    const guessed = batteryEntityFromMower(typeof entities === "object" ? entities?.mower : null);
+    if (guessed && guessed !== entityId) {
+      const fromGuess = parseNumericState(hass, guessed);
+      if (fromGuess != null) return fromGuess;
     }
     return null;
   }
@@ -874,7 +889,7 @@
       const features = mowerFeatures(this.hass, entities);
       const charging = isOn(this.hass, entities.charging);
       const online = isOn(this.hass, entities.online);
-      const batt = batteryLevel(this.hass, entities.battery);
+      const batt = batteryLevel(this.hass, entities);
       const statusLabel = displayStatus(this.hass, entities, activity, this._pending, cfg);
       const title =
         cfg.name ||
