@@ -464,7 +464,7 @@
         _pending: { state: null },
         _mapTick: { state: 0 },
         _mapFailed: { state: false },
-        _artFailed: { state: false },
+        _artFailedSrc: { state: null },
         _selectedZones: { state: null },
       };
     }
@@ -532,7 +532,7 @@
         this._stopMapTimer();
         this._startMapTimer();
         this._mapFailed = false;
-        this._artFailed = false;
+        this._artFailedSrc = null;
       }
       if (changed.has("hass") && this._mapFailed) {
         const entities = resolveEntities(this.hass, mergeConfig(this.config));
@@ -808,14 +808,17 @@
         `;
       }
 
-      if (artOn && artSrc && !this._artFailed) {
+      if (artOn && artSrc && this._artFailedSrc !== artSrc) {
         return html`
           <div class="hero art-hero ${phase}">
             <img
               src=${artSrc}
               alt=""
               draggable="false"
-              @error=${(ev) => this._onArtError(ev, artSrc)}
+              @load=${() => {
+                if (this._artFailedSrc === artSrc) this._artFailedSrc = null;
+              }}
+              @error=${(ev) => this._onArtError(ev, artSrc, img)}
             />
           </div>
         `;
@@ -832,17 +835,19 @@
       this._mapFailed = true;
     }
 
-    _onArtError(ev, src) {
+    _onArtError(ev, src, rawPath) {
       const el = ev.target;
       if (el && !el.dataset?.fallbackTried) {
-        const raw = String(src || "").replace(/^https?:\/\/[^/]+/i, "");
-        if (raw && raw !== src) {
+        const local = String(rawPath || src || "").trim();
+        const stripped = String(src || "").replace(/^https?:\/\/[^/]+/i, "");
+        const retry = local.startsWith("/") ? local : stripped.startsWith("/") ? stripped : "";
+        if (retry && retry !== el.src && retry !== src) {
           el.dataset.fallbackTried = "1";
-          el.src = raw;
+          el.src = retry;
           return;
         }
       }
-      this._artFailed = true;
+      this._artFailedSrc = src;
     }
 
     _mowerSvg(phase) {
