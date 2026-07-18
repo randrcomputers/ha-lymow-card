@@ -5,6 +5,7 @@ hero_mode: art
 show_map: true
 show_stats: true
 show_mow_mode: true
+show_zone_picker: true
 show_secondary_actions: true
 # Copy lymow_card/ → config/www/lymow_card/
 image_dock: /local/lymow_card/lymow_docked.png

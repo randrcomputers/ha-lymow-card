@@ -16,6 +16,7 @@
     show_stats: true,
     show_mow_mode: true,
     show_secondary_actions: true,
+    show_zone_picker: true,
     map_refresh_seconds: 30,
   });
 
@@ -28,6 +29,7 @@
     blade: "_blade_height",
     rtk: "_rtk_status",
     map: "_map",
+    map_geojson: "_map_geojson",
     mow_mode: "_clean_mode_select",
     online: "_online",
     mowing: "_mowing",
@@ -102,6 +104,7 @@
       blade: config.entity_blade || null,
       rtk: config.entity_rtk || null,
       map: config.entity_map || null,
+      map_geojson: config.entity_map_geojson || null,
       mow_mode: config.entity_mow_mode || null,
       online: config.entity_online || null,
       mowing: config.entity_mowing || null,
@@ -223,6 +226,51 @@
     return !config?.device && !config?.entity_mower;
   }
 
+  function hasStartZonesService(hass) {
+    return Boolean(hass?.services?.lymow?.start_zones);
+  }
+
+  function isHashLike(value) {
+    const s = String(value || "").trim();
+    return /^[A-Za-z0-9_-]{6,}$/.test(s) && !/\s/.test(s);
+  }
+
+  /** Zone list from Map GeoJSON sensor (Lymow-HA). */
+  function loadZones(hass, entityId) {
+    const st = entityState(hass, entityId);
+    if (!st?.attributes) return [];
+    const attrs = st.attributes;
+    let features = [];
+    if (attrs.geojson?.features) {
+      features = attrs.geojson.features;
+    } else if (attrs.geojson_zones?.features) {
+      features = attrs.geojson_zones.features;
+    }
+    const zones = [];
+    const seen = new Set();
+    for (const f of features) {
+      const p = f?.properties || {};
+      if (p.type && p.type !== "zone") continue;
+      const id = p.hashId || p.hash_id || p.id;
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      let name = p.name ? String(p.name) : String(id);
+      if (!p.name && isHashLike(name)) {
+        name = `Zone ${zones.length + 1}`;
+      }
+      zones.push({ id: String(id), name });
+    }
+    zones.sort((a, b) => a.name.localeCompare(b.name));
+    return zones;
+  }
+
+  function zoneSelectionSummary(selected, total) {
+    if (!selected?.size) return "All zones";
+    if (selected.size === 1) return "1 zone selected";
+    if (selected.size === total) return "All zones";
+    return `${selected.size} zones selected`;
+  }
+
   class LymowCard extends LitElement {
     static get properties() {
       return {
@@ -232,6 +280,7 @@
         _pending: { state: null },
         _mapTick: { state: 0 },
         _mapFailed: { state: false },
+        _selectedZones: { state: null },
       };
     }
 
@@ -249,11 +298,37 @@
       if (cfg.show_stats) size += 1;
       if (cfg.show_mow_mode) size += 1;
       if (cfg.show_secondary_actions) size += 1;
+      if (cfg.show_zone_picker !== false && this.hass) {
+        const entities = resolveEntities(this.hass, cfg);
+        const zones = loadZones(this.hass, cfg.entity_map_geojson || entities.map_geojson);
+        if (zones.length > 0) size += 2;
+      }
       return size;
     }
 
     setConfig(config) {
       this.config = mergeConfig(config);
+      this._selectedZones = this._selectedZones || new Set();
+    }
+
+    _zoneList(cfg, entities) {
+      return loadZones(this.hass, cfg.entity_map_geojson || entities.map_geojson);
+    }
+
+    _selectedZoneSet() {
+      if (!this._selectedZones) this._selectedZones = new Set();
+      return this._selectedZones;
+    }
+
+    _toggleZone(zoneId) {
+      const next = new Set(this._selectedZoneSet());
+      if (next.has(zoneId)) next.delete(zoneId);
+      else next.add(zoneId);
+      this._selectedZones = next;
+    }
+
+    _clearZoneSelection() {
+      this._selectedZones = new Set();
     }
 
     connectedCallback() {
@@ -326,6 +401,44 @@
       } finally {
         this._busy = false;
       }
+    }
+
+    async _startMowing(cfg, entities) {
+      if (!entities.mower || this._busy) return;
+      const zones = this._zoneList(cfg, entities);
+      const selected = this._selectedZoneSet();
+      const useZones =
+        cfg.show_zone_picker !== false &&
+        hasStartZonesService(this.hass) &&
+        selected.size > 0 &&
+        zones.length > 0;
+
+      this._busy = true;
+      this._pending = "start";
+      try {
+        if (useZones) {
+          const payload = {
+            zones: [...selected].map((id) => {
+              const z = zones.find((x) => x.id === id);
+              return z?.name || id;
+            }),
+          };
+          if (cfg.device) payload.device_id = cfg.device;
+          await this._call("lymow", "start_zones", payload);
+        } else {
+          await this._call("lawn_mower", "start_mowing", { entity_id: entities.mower });
+        }
+      } finally {
+        this._busy = false;
+      }
+    }
+
+    async _primaryAction(cfg, entities, primaryAction, resume = false) {
+      if (primaryAction === "start_mowing" && !resume) {
+        await this._startMowing(cfg, entities);
+        return;
+      }
+      await this._mowerAction(primaryAction);
     }
 
     async _pressButton(entityId) {
@@ -438,6 +551,51 @@
               `
             )}
           </select>
+        </div>
+      `;
+    }
+
+    _renderZonePicker(cfg, entities, showStart) {
+      if (cfg.show_zone_picker === false || !showStart) return nothing;
+      const zones = this._zoneList(cfg, entities);
+      if (!zones.length) return nothing;
+
+      const selected = this._selectedZoneSet();
+      const summary = zoneSelectionSummary(selected, zones.length);
+
+      return html`
+        <div class="zones">
+          <div class="zones-head">
+            <span class="zones-label">Mow zones</span>
+            <span class="zones-summary">${summary}</span>
+          </div>
+          <div class="zone-chips">
+            <button
+              type="button"
+              class="zone-chip all ${selected.size === 0 ? "on" : ""}"
+              ?disabled=${this._busy}
+              @click=${() => this._clearZoneSelection()}
+              title="Start full map (lawn_mower.start_mowing)"
+            >
+              All
+            </button>
+            ${zones.map(
+              (z) => html`
+                <button
+                  type="button"
+                  class="zone-chip ${selected.has(z.id) ? "on" : ""}"
+                  ?disabled=${this._busy}
+                  @click=${() => this._toggleZone(z.id)}
+                  title=${z.id}
+                >
+                  ${z.name}
+                </button>
+              `
+            )}
+          </div>
+          ${selected.size > 0
+            ? html`<p class="zones-hint">Start mows selected zones only.</p>`
+            : html`<p class="zones-hint">Pick zones, or leave <strong>All</strong> for full map.</p>`}
         </div>
       `;
     }
@@ -572,7 +730,13 @@
       const showPause = canPause(features) && (activity === "mowing" || activity === "returning");
       const showResume = canStart(features) && activity === "paused";
       const showStart = canStart(features) && (activity === "docked" || activity === "error" || activity === "unknown");
-      const primaryLabel = showPause ? "Pause" : showResume ? "Resume" : "Start";
+      const primaryLabel = showPause
+        ? "Pause"
+        : showResume
+          ? "Resume"
+          : this._selectedZoneSet().size > 0
+            ? `Start (${this._selectedZoneSet().size})`
+            : "Start";
       const primaryAction = showPause ? "pause" : "start_mowing";
       const primaryEnabled = showPause || showResume || showStart;
 
@@ -603,11 +767,13 @@
             ${this._renderProgress(this.hass, entities, activity)}
             ${cfg.show_stats ? this._renderStats(this.hass, entities) : nothing}
 
+            ${this._renderZonePicker(cfg, entities, showStart)}
+
             <div class="actions primary">
               <button
                 class="act primary-btn"
                 ?disabled=${this._busy || !primaryEnabled}
-                @click=${() => this._mowerAction(primaryAction)}
+                @click=${() => this._primaryAction(cfg, entities, primaryAction, showResume)}
               >
                 ${primaryLabel}
               </button>
@@ -986,6 +1152,65 @@
         .pending .dock-btn {
           opacity: 0.7;
         }
+        .zones {
+          display: flex;
+          flex-direction: column;
+          gap: 6px;
+        }
+        .zones-head {
+          display: flex;
+          align-items: baseline;
+          justify-content: space-between;
+          gap: 8px;
+        }
+        .zones-label {
+          font-size: 0.78rem;
+          font-weight: 600;
+          color: var(--secondary-text-color);
+        }
+        .zones-summary {
+          font-size: 0.72rem;
+          color: var(--secondary-text-color);
+        }
+        .zone-chips {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+        .zone-chip {
+          border: 1px solid var(--divider-color, rgba(255, 255, 255, 0.12));
+          background: var(--secondary-background-color);
+          color: var(--primary-text-color);
+          border-radius: 999px;
+          padding: 5px 10px;
+          font-size: 0.76rem;
+          font-weight: 600;
+          cursor: pointer;
+          max-width: 100%;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .zone-chip.on {
+          background: rgba(34, 197, 94, 0.22);
+          border-color: #22c55e;
+          color: #bbf7d0;
+        }
+        .zone-chip.all.on {
+          background: rgba(59, 130, 246, 0.2);
+          border-color: #3b82f6;
+          color: #bfdbfe;
+        }
+        .zone-chip:disabled {
+          opacity: 0.45;
+          cursor: not-allowed;
+        }
+        .zones-hint {
+          margin: 0;
+          font-size: 0.7rem;
+          color: var(--secondary-text-color);
+          line-height: 1.35;
+        }
       `;
     }
   }
@@ -1025,6 +1250,7 @@
             { name: "entity_progress", selector: { entity: { domain: "sensor" } } },
             { name: "entity_area", selector: { entity: { domain: "sensor" } } },
             { name: "entity_map", selector: { entity: { domain: "camera" } } },
+            { name: "entity_map_geojson", selector: { entity: { domain: "sensor" } } },
             { name: "entity_mow_mode", selector: { entity: { domain: "select" } } },
             { name: "entity_online", selector: { entity: { domain: "binary_sensor" } } },
             { name: "entity_error", selector: { entity: { domain: "binary_sensor" } } },
@@ -1046,6 +1272,7 @@
             { name: "show_map", selector: { boolean: {} } },
             { name: "show_stats", selector: { boolean: {} } },
             { name: "show_mow_mode", selector: { boolean: {} } },
+            { name: "show_zone_picker", selector: { boolean: {} } },
             { name: "show_secondary_actions", selector: { boolean: {} } },
             { name: "image_mower", selector: { text: {} } },
             { name: "image_dock", selector: { text: {} } },
@@ -1063,6 +1290,7 @@
               entity_progress: "Session progress sensor",
               entity_area: "Session area sensor",
               entity_map: "Map camera",
+              entity_map_geojson: "Map GeoJSON sensor (zone list)",
               entity_mow_mode: "Mow mode select",
               entity_online: "Online binary sensor",
               entity_error: "Error binary sensor",
@@ -1073,6 +1301,7 @@
               show_map: "Enable map camera in hero",
               show_stats: "Show stats row (area, height, RTK)",
               show_mow_mode: "Show mow pattern selector",
+              show_zone_picker: "Show zone picker (Start selected zones)",
               show_secondary_actions: "Show cancel / dock & cancel buttons",
               image_mower: "Away image URL — empty dock while mowing (/local/…)",
               image_dock: "Docked image URL — robot on station (/local/…)",

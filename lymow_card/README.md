@@ -19,7 +19,24 @@ These assets use **transparent backgrounds** so they blend with any Home Assista
 | `lymow_docked.png` | **Dock image URL** (`image_dock`) | Docked, charging, idle |
 | `lymow_dock_empty.png` | **Mower image URL** (`image_mower`) | Mowing, returning, paused (robot away) |
 
-No grass, fence, or outdoor scene — generic product cutouts only.
+No grass, fence, or outdoor scene — generic transparent cutouts only.
+
+Transparency uses **edge-connected backdrop removal** so grey/silver QR markers and plastic highlights stay fully opaque (not punched out).
+
+Rebuild both PNGs:
+
+```bash
+python tools/build_card_images.py
+```
+
+Requires matching studio sources in `assets/`:
+
+- `lymow_docked_v2.png` — robot on dock
+- `lymow_dock_empty_v2.png` — **same angle/framing**, empty dock only
+
+Both are processed identically so the card swap is seamless (same canvas 848×581, same bbox).
+
+If you regenerate the empty dock, use the docked image as reference so scale/angle match. Optional fallback aligner: `python tools/align_empty_dock.py`.
 
 ## Default YAML
 

@@ -14,6 +14,7 @@ Replaces generic cards like [compact-lawn-mower-card](https://github.com/Tra1n84
 - **Session progress bar** — uses `Session Progress` sensor during active runs
 - **Stats row** — mowed area, blade height, RTK fix
 - **Smart actions** — Start / Resume / Pause / Dock via `lawn_mower` services; Cancel task & Dock & cancel via integration buttons
+- **Zone picker** — choose one or more map zones before Start (`lymow.start_zones`); **All** runs the full map (`lawn_mower.start_mowing`)
 - **Mow pattern** — dropdown wired to the integration **Mow Mode** select
 - **Alert chips** — error, lifted, rain delay
 
@@ -59,6 +60,7 @@ See `examples/dashboard-card.yaml` for a full snippet.
 | **Show map camera** | on | Uses integration **Map** camera in the hero area |
 | **Show stats row** | on | Area, blade height, RTK |
 | **Show mow pattern selector** | on | Integration **Mow Mode** select |
+| **Show zone picker** | on | Zone chips when docked (requires Map GeoJSON sensor) |
 | **Show secondary actions** | on | Cancel task, Dock & cancel buttons |
 | **Mower image URL** | empty dock | Shown while mowing (`lymow_dock_empty.png`) |
 | **Dock image URL** | docked photo | Shown while docked/charging (`lymow_docked.png`) |
@@ -76,6 +78,7 @@ See `examples/dashboard-card.yaml` for a full snippet.
 | Blade Height | Stats |
 | RTK GPS | Stats |
 | Map (camera) | Hero map |
+| Map GeoJSON (sensor) | Zone list for Start |
 | Mow Mode (select) | Pattern dropdown |
 | Online | Cloud indicator |
 | Error / Lifted / Rain delay | Alert chips |
@@ -110,6 +113,13 @@ image_mower: /local/lymow_card/lymow_dock_empty.png
 ### Map hero blank but docked art works
 
 The integration **Map** camera may be empty on first poll. The card falls back to PNG artwork when the map fails to load.
+
+### Zone picker empty or missing
+
+1. Confirm the integration exposes a **Map GeoJSON** sensor (`*_map_geojson`) — the card auto-wires it from your Lymow device.
+2. Open the sensor in **Developer tools → States** and check `geojson.features` (or `geojson_zones.features`) includes entries with `properties.type: zone`.
+3. **Start all** (no chips selected, or tap **All**) calls `lawn_mower.start_mowing`. Selected zones call `lymow.start_zones` (requires Lymow-HA with that service).
+4. Hide the picker with `show_zone_picker: false` if you only ever mow the full map.
 
 ## Requirements
 
