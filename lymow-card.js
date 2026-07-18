@@ -320,15 +320,27 @@
 
   function showMapHero(cfg, activity) {
     if (!cfg.show_map) return false;
-    if (cfg.hero_mode === "map") return true;
     if (cfg.hero_mode === "art") return false;
-    return activity === "mowing" || activity === "returning" || activity === "paused";
+    const active =
+      activity === "mowing" || activity === "returning" || activity === "paused";
+    // Map camera is blank while docked — only use it during an active run.
+    return active;
   }
 
   function showArtHero(cfg, activity) {
     if (cfg.hero_mode === "art") return true;
-    if (cfg.hero_mode === "map") return false;
+    if (cfg.hero_mode === "map") {
+      const active =
+        activity === "mowing" || activity === "returning" || activity === "paused";
+      return !active;
+    }
     return !showMapHero(cfg, activity);
+  }
+
+  function heroArtPath(cfg, activity) {
+    const active =
+      activity === "mowing" || activity === "returning" || activity === "paused";
+    return active ? cfg.image_mower : cfg.image_dock || cfg.image_mower;
   }
 
   function batteryEntityFromMower(mowerEntityId) {
@@ -452,6 +464,7 @@
         _pending: { state: null },
         _mapTick: { state: 0 },
         _mapFailed: { state: false },
+        _artFailed: { state: false },
         _selectedZones: { state: null },
       };
     }
@@ -519,6 +532,7 @@
         this._stopMapTimer();
         this._startMapTimer();
         this._mapFailed = false;
+        this._artFailed = false;
       }
       if (changed.has("hass") && this._mapFailed) {
         const entities = resolveEntities(this.hass, mergeConfig(this.config));
@@ -773,11 +787,7 @@
       const mapOn =
         showMapHero(cfg, activity) && entities.map && !this._mapFailed;
       const artOn = showArtHero(cfg, activity);
-
-      const img =
-        activity === "mowing" || activity === "returning" || activity === "paused"
-          ? cfg.image_mower
-          : cfg.image_dock || cfg.image_mower;
+      const img = heroArtPath(cfg, activity);
       const artSrc = mediaUrl(this.hass, img);
 
       if (mapOn) {
@@ -798,7 +808,7 @@
         `;
       }
 
-      if (artOn && artSrc) {
+      if (artOn && artSrc && !this._artFailed) {
         return html`
           <div class="hero art-hero ${phase}">
             <img
@@ -824,18 +834,15 @@
 
     _onArtError(ev, src) {
       const el = ev.target;
-      if (el?.dataset?.fallbackTried) {
-        el.style.display = "none";
-        return;
+      if (el && !el.dataset?.fallbackTried) {
+        const raw = String(src || "").replace(/^https?:\/\/[^/]+/i, "");
+        if (raw && raw !== src) {
+          el.dataset.fallbackTried = "1";
+          el.src = raw;
+          return;
+        }
       }
-      // Retry once without hassUrl in case of double-prefix edge cases.
-      const raw = String(src || "").replace(/^https?:\/\/[^/]+/i, "");
-      if (raw && raw !== src) {
-        el.dataset.fallbackTried = "1";
-        el.src = raw;
-        return;
-      }
-      el.style.display = "none";
+      this._artFailed = true;
     }
 
     _mowerSvg(phase) {
