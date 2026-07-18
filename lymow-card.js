@@ -81,11 +81,51 @@
     return st?.state === "on";
   }
 
-  function numState(hass, entityId) {
+  function normalizeEntityId(value) {
+    if (!value) return null;
+    if (typeof value === "string") {
+      const s = value.trim();
+      return s || null;
+    }
+    if (typeof value === "object" && value.entity_id) {
+      const s = String(value.entity_id).trim();
+      return s || null;
+    }
+    return null;
+  }
+
+  /** Avoid auto_recharge_battery / auto_resume_battery matching the battery suffix. */
+  function matchesEntitySuffix(uid, key, suffix) {
+    if (!uid || !suffix || !uid.endsWith(suffix)) return false;
+    if (key === "battery") {
+      return !uid.endsWith("_auto_recharge_battery") && !uid.endsWith("_auto_resume_battery");
+    }
+    return true;
+  }
+
+  function parseNumericState(hass, entityId) {
     const st = entityState(hass, entityId);
     if (!st) return null;
-    const n = Number(st.state);
-    return Number.isFinite(n) ? n : null;
+    const raw = st.state;
+    if (raw == null || raw === "unavailable" || raw === "unknown" || raw === "") return null;
+    const direct = Number(raw);
+    if (Number.isFinite(direct)) return direct;
+    const m = String(raw).trim().match(/^(-?\d+(?:\.\d+)?)\s*%?$/);
+    if (m) {
+      const parsed = Number(m[1]);
+      return Number.isFinite(parsed) ? parsed : null;
+    }
+    const attrs = st.attributes || {};
+    for (const key of ["battery_level", "battery", "percentage", "level"]) {
+      if (attrs[key] == null) continue;
+      const n = Number(attrs[key]);
+      if (Number.isFinite(n)) return n;
+    }
+    return null;
+  }
+
+  function numState(hass, entityId) {
+    return parseNumericState(hass, entityId);
   }
 
   function textState(hass, entityId, fallback = "—") {
@@ -96,24 +136,24 @@
 
   function resolveEntities(hass, config) {
     const manual = {
-      mower: config.entity_mower || null,
-      status: config.entity_status || null,
-      battery: config.entity_battery || null,
-      progress: config.entity_progress || null,
-      area: config.entity_area || null,
-      blade: config.entity_blade || null,
-      rtk: config.entity_rtk || null,
-      map: config.entity_map || null,
-      map_geojson: config.entity_map_geojson || null,
-      mow_mode: config.entity_mow_mode || null,
-      online: config.entity_online || null,
-      mowing: config.entity_mowing || null,
-      charging: config.entity_charging || null,
-      error: config.entity_error || null,
-      lifted: config.entity_lifted || null,
-      rain: config.entity_rain || null,
-      btn_cancel: config.entity_btn_cancel || null,
-      btn_dock_cancel: config.entity_btn_dock_cancel || null,
+      mower: normalizeEntityId(config.entity_mower),
+      status: normalizeEntityId(config.entity_status),
+      battery: normalizeEntityId(config.entity_battery),
+      progress: normalizeEntityId(config.entity_progress),
+      area: normalizeEntityId(config.entity_area),
+      blade: normalizeEntityId(config.entity_blade),
+      rtk: normalizeEntityId(config.entity_rtk),
+      map: normalizeEntityId(config.entity_map),
+      map_geojson: normalizeEntityId(config.entity_map_geojson),
+      mow_mode: normalizeEntityId(config.entity_mow_mode),
+      online: normalizeEntityId(config.entity_online),
+      mowing: normalizeEntityId(config.entity_mowing),
+      charging: normalizeEntityId(config.entity_charging),
+      error: normalizeEntityId(config.entity_error),
+      lifted: normalizeEntityId(config.entity_lifted),
+      rain: normalizeEntityId(config.entity_rain),
+      btn_cancel: normalizeEntityId(config.entity_btn_cancel),
+      btn_dock_cancel: normalizeEntityId(config.entity_btn_dock_cancel),
     };
 
     if (!config.device) return manual;
@@ -132,7 +172,7 @@
       }
 
       for (const [key, suffix] of Object.entries(ENTITY_SUFFIXES)) {
-        if (!uid.endsWith(suffix)) continue;
+        if (!matchesEntitySuffix(uid, key, suffix)) continue;
         if (key === "error" && domain !== "binary_sensor") continue;
         if (key === "mower") continue;
         if (hass.states[eid] || key === "map") {
@@ -141,7 +181,12 @@
       }
     }
 
-    return { ...found, ...manual, mower: manual.mower || found.mower };
+    const merged = { ...found };
+    for (const [key, value] of Object.entries(manual)) {
+      if (value) merged[key] = value;
+    }
+    merged.mower = manual.mower || found.mower;
+    return merged;
   }
 
   function mowerActivity(hass, entities) {
@@ -206,7 +251,14 @@
   }
 
   function batteryLevel(hass, entities) {
-    return numState(hass, entities.battery);
+    const fromSensor = parseNumericState(hass, entities.battery);
+    if (fromSensor != null) return fromSensor;
+    const mower = entityState(hass, entities.mower);
+    if (mower?.attributes?.battery_level != null) {
+      const n = Number(mower.attributes.battery_level);
+      if (Number.isFinite(n)) return n;
+    }
+    return null;
   }
 
   function batteryClass(level, charging) {
