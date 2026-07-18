@@ -4,6 +4,8 @@ Lovelace card built for the **[Lymow-HA](https://github.com/d3dfantasy99/Lymow-H
 
 Replaces generic cards like [compact-lawn-mower-card](https://github.com/Tra1n84/compact-lawn-mower-card) with entity wiring and UI specific to Lymow.
 
+<img width="490" height="571" alt="image" src="https://github.com/user-attachments/assets/fccf489a-1408-46c1-8f3b-01d52654abf0" />
+
 ## Features
 
 - **Lymow device picker** — auto-fills mower, status, battery, map camera, buttons, and more
