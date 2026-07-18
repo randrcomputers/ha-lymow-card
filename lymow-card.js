@@ -437,8 +437,8 @@
     return `Zone ${index + 1}`;
   }
 
-  /** Zone list from Map GeoJSON sensor (Lymow-HA). */
-  function loadZones(hass, entityId) {
+  /** Zone polygons from Map GeoJSON sensor (Lymow-HA). */
+  function loadZoneFeatures(hass, entityId) {
     const st = entityState(hass, entityId);
     if (!st?.attributes) return [];
     const attrs = st.attributes;
@@ -455,10 +455,16 @@
       if (p.type && p.type !== "zone") continue;
       const id = p.hashId || p.hash_id || p.id;
       if (!id || seen.has(id)) continue;
+      const geom = f.geometry;
+      if (!geom || geom.type !== "Polygon" || !geom.coordinates?.[0]?.length) continue;
+      const ring = geom.coordinates[0]
+        .map((pt) => [Number(pt[0]), Number(pt[1])])
+        .filter((pt) => Number.isFinite(pt[0]) && Number.isFinite(pt[1]));
+      if (ring.length < 3) continue;
       seen.add(id);
       const index = zones.length;
       const name = zoneDisplayName(p, String(id), index);
-      zones.push({ id: String(id), name, index });
+      zones.push({ id: String(id), name, index, ring });
     }
     zones.sort((a, b) => {
       const na = a.name.match(/^Zone\s+(\d+)$/i);
@@ -467,6 +473,46 @@
       return a.index - b.index;
     });
     return zones;
+  }
+
+  function zoneFeatureBounds(zoneFeatures) {
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const z of zoneFeatures) {
+      for (const [x, y] of z.ring) {
+        minX = Math.min(minX, x);
+        maxX = Math.max(maxX, x);
+        minY = Math.min(minY, y);
+        maxY = Math.max(maxY, y);
+      }
+    }
+    if (!Number.isFinite(minX)) return null;
+    const width = maxX - minX || 1;
+    const height = maxY - minY || 1;
+    return { minX, minY, width, height, pad: 4 };
+  }
+
+  function ringToSvgPoints(ring, bounds) {
+    const { minX, minY, width, height, pad } = bounds;
+    const inner = 100 - pad * 2;
+    return ring
+      .map(([x, y]) => {
+        const nx = pad + ((x - minX) / width) * inner;
+        const ny = pad + (1 - (y - minY) / height) * inner;
+        return `${nx.toFixed(2)},${ny.toFixed(2)}`;
+      })
+      .join(" ");
+  }
+
+  /** Zone list from Map GeoJSON sensor (Lymow-HA). */
+  function loadZones(hass, entityId) {
+    return loadZoneFeatures(hass, entityId).map(({ id, name, index }) => ({
+      id,
+      name,
+      index,
+    }));
   }
 
   function zoneSelectionSummary(selected, total) {
@@ -804,6 +850,48 @@
       `;
     }
 
+    _renderZoneHighlightSvg(zoneFeatures, selected) {
+      if (!selected?.size || !zoneFeatures?.length) return nothing;
+      const bounds = zoneFeatureBounds(zoneFeatures);
+      if (!bounds) return nothing;
+      return html`
+        <svg class="zone-overlay" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+          ${zoneFeatures.map((z) => {
+            const on = selected.has(z.id);
+            const pts = ringToSvgPoints(z.ring, bounds);
+            return html`
+              <polygon
+                points=${pts}
+                class=${on ? "selected" : "dimmed"}
+              ></polygon>
+            `;
+          })}
+        </svg>
+      `;
+    }
+
+    _renderGeoJsonHero(zoneFeatures, selected, phase) {
+      const bounds = zoneFeatureBounds(zoneFeatures);
+      if (!bounds) return nothing;
+      return html`
+        <div class="hero geo-hero ${phase}">
+          <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+            ${zoneFeatures.map((z) => {
+              const on = !selected?.size || selected.has(z.id);
+              const pts = ringToSvgPoints(z.ring, bounds);
+              return html`
+                <polygon
+                  points=${pts}
+                  class=${on && selected?.size ? "selected" : selected?.size ? "dimmed" : "idle"}
+                ></polygon>
+              `;
+            })}
+          </svg>
+          <div class="map-badge">Zone map</div>
+        </div>
+      `;
+    }
+
     _renderHero(cfg, entities, activity, phase) {
       const mode = normalizeHeroMode(cfg.hero_mode);
       const mapAllowed = showMapHero(cfg, activity) && entities.map;
@@ -812,6 +900,15 @@
       const artOn = shouldShowArt(cfg, activity, Boolean(entities.map));
       const img = heroArtPath(cfg, activity);
       const artSrc = mediaUrl(this.hass, img);
+      const selected = this._selectedZoneSet();
+      const zoneFeatures = loadZoneFeatures(
+        this.hass,
+        cfg.entity_map_geojson || entities.map_geojson
+      );
+      const highlightZones =
+        cfg.show_zone_picker !== false &&
+        selected.size > 0 &&
+        zoneFeatures.length > 0;
 
       if (mapOn) {
         const st = entityState(this.hass, entities.map);
@@ -820,15 +917,24 @@
         void this._mapTick;
         return html`
           <div class="hero map-hero ${phase}">
-            <img
-              src=${src}
-              alt="Lymow map"
-              draggable="false"
-              @error=${this._onMapError}
-            />
+            <div class="map-stack">
+              <img
+                src=${src}
+                alt="Lymow map"
+                draggable="false"
+                @error=${this._onMapError}
+              />
+              ${highlightZones
+                ? this._renderZoneHighlightSvg(zoneFeatures, selected)
+                : nothing}
+            </div>
             <div class="map-badge">Live map</div>
           </div>
         `;
+      }
+
+      if (highlightZones) {
+        return this._renderGeoJsonHero(zoneFeatures, selected, phase);
       }
 
       if (artOn && artSrc && this._artFailedSrc !== artSrc) {
@@ -1144,6 +1250,52 @@
           object-fit: contain;
           display: block;
           border-radius: 8px;
+        }
+        .map-stack {
+          position: relative;
+          width: 100%;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+        }
+        .map-stack img {
+          width: 100%;
+          max-height: 160px;
+          object-fit: contain;
+          display: block;
+          border-radius: 8px;
+        }
+        .zone-overlay {
+          position: absolute;
+          inset: 0;
+          width: 100%;
+          height: 100%;
+          pointer-events: none;
+        }
+        .zone-overlay .selected,
+        .geo-hero .selected {
+          fill: rgba(74, 222, 128, 0.45);
+          stroke: #4ade80;
+          stroke-width: 0.75;
+        }
+        .zone-overlay .dimmed,
+        .geo-hero .dimmed {
+          fill: rgba(0, 0, 0, 0.28);
+          stroke: rgba(255, 255, 255, 0.12);
+          stroke-width: 0.35;
+        }
+        .geo-hero {
+          background: radial-gradient(circle at 50% 45%, #14532d 0%, #0f172a 72%);
+        }
+        .geo-hero svg {
+          width: 100%;
+          max-height: 160px;
+          display: block;
+        }
+        .geo-hero .idle {
+          fill: rgba(34, 197, 94, 0.22);
+          stroke: rgba(134, 239, 172, 0.45);
+          stroke-width: 0.5;
         }
         .map-badge {
           position: absolute;
