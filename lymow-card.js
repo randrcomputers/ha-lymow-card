@@ -318,29 +318,31 @@
     return activity || "idle";
   }
 
+  function isActiveRun(activity) {
+    return activity === "mowing" || activity === "returning" || activity === "paused";
+  }
+
   function showMapHero(cfg, activity) {
-    if (!cfg.show_map) return false;
-    if (cfg.hero_mode === "art") return false;
-    const active =
-      activity === "mowing" || activity === "returning" || activity === "paused";
-    // Map camera is blank while docked — only use it during an active run.
-    return active;
+    if (!cfg.show_map || cfg.hero_mode === "art") return false;
+    if (cfg.hero_mode === "map") return true;
+    return isActiveRun(activity);
   }
 
   function showArtHero(cfg, activity) {
     if (cfg.hero_mode === "art") return true;
-    if (cfg.hero_mode === "map") {
-      const active =
-        activity === "mowing" || activity === "returning" || activity === "paused";
-      return !active;
-    }
-    return !showMapHero(cfg, activity);
+    if (cfg.hero_mode === "map") return false;
+    return !isActiveRun(activity);
+  }
+
+  /** Art when docked in auto, always in art mode, or as map fallback. */
+  function shouldShowArt(cfg, activity, mapFailed, hasMap) {
+    if (showArtHero(cfg, activity)) return true;
+    if (cfg.hero_mode === "map" && (mapFailed || !hasMap)) return true;
+    return false;
   }
 
   function heroArtPath(cfg, activity) {
-    const active =
-      activity === "mowing" || activity === "returning" || activity === "paused";
-    return active ? cfg.image_mower : cfg.image_dock || cfg.image_mower;
+    return isActiveRun(activity) ? cfg.image_mower : cfg.image_dock || cfg.image_mower;
   }
 
   function batteryEntityFromMower(mowerEntityId) {
@@ -786,7 +788,7 @@
     _renderHero(cfg, entities, activity, phase) {
       const mapOn =
         showMapHero(cfg, activity) && entities.map && !this._mapFailed;
-      const artOn = showArtHero(cfg, activity);
+      const artOn = shouldShowArt(cfg, activity, this._mapFailed, Boolean(entities.map));
       const img = heroArtPath(cfg, activity);
       const artSrc = mediaUrl(this.hass, img);
 
