@@ -17,6 +17,7 @@
     show_mow_mode: true,
     show_secondary_actions: true,
     show_zone_picker: true,
+    show_headlights: true,
     map_refresh_seconds: 30,
   });
 
@@ -26,6 +27,7 @@
     battery: "_battery",
     progress: "_session_percent",
     area: "_session_area",
+    map_area: "_map_area",
     blade: "_blade_height",
     rtk: "_rtk_status",
     map: "_map",
@@ -37,8 +39,32 @@
     error: "_error",
     lifted: "_lifted",
     rain: "_rain_delay",
+    headlights: "_headlights",
     btn_cancel: "_btn_cancel_task",
     btn_dock_cancel: "_btn_dock_cancel",
+  };
+
+  const ENTITY_DOMAINS = {
+    mower: "lawn_mower",
+    status: "sensor",
+    battery: "sensor",
+    progress: "sensor",
+    area: "sensor",
+    map_area: "sensor",
+    blade: "sensor",
+    rtk: "sensor",
+    map: "camera",
+    map_geojson: "sensor",
+    mow_mode: "select",
+    online: "binary_sensor",
+    mowing: "binary_sensor",
+    charging: "binary_sensor",
+    error: "binary_sensor",
+    lifted: "binary_sensor",
+    rain: "binary_sensor",
+    headlights: "switch",
+    btn_cancel: "button",
+    btn_dock_cancel: "button",
   };
 
   const ACTIVITY_LABELS = {
@@ -225,6 +251,49 @@
     return String(st.state);
   }
 
+  function entityExists(hass, entityId) {
+    return Boolean(entityId && (hass?.states?.[entityId] || hass?.entities?.[entityId]));
+  }
+
+  function mowerSlug(mowerEntityId) {
+    if (!mowerEntityId || !String(mowerEntityId).includes(".")) return null;
+    return String(mowerEntityId).split(".").slice(1).join(".");
+  }
+
+  function entityFromMowerSuffix(mowerEntityId, suffix, domain) {
+    const slug = mowerSlug(mowerEntityId);
+    if (!slug || !suffix || !domain) return null;
+    return `${domain}.${slug}${suffix}`;
+  }
+
+  function resolveDeviceId(hass, config, mowerEntityId) {
+    const fromConfig = normalizeDeviceId(config?.device);
+    if (fromConfig) return fromConfig;
+    if (mowerEntityId && hass?.entities?.[mowerEntityId]?.device_id) {
+      return hass.entities[mowerEntityId].device_id;
+    }
+    return null;
+  }
+
+  function applyMowerSlugFallbacks(hass, merged, mowerEntityId) {
+    if (!mowerEntityId) return merged;
+    for (const [key, suffix] of Object.entries(ENTITY_SUFFIXES)) {
+      if (merged[key] || key === "mower") continue;
+      const domain = ENTITY_DOMAINS[key];
+      if (!domain) continue;
+      const guessed = entityFromMowerSuffix(mowerEntityId, suffix, domain);
+      if (entityExists(hass, guessed)) merged[key] = guessed;
+    }
+    return merged;
+  }
+
+  function canDiscoverEntity(hass, eid, key, domain) {
+    if (hass.states[eid]) return true;
+    if (key === "map") return true;
+    if (domain === "button" || domain === "switch") return entityExists(hass, eid);
+    return false;
+  }
+
   function resolveEntities(hass, config) {
     const manual = {
       mower: normalizeEntityId(config.entity_mower),
@@ -232,6 +301,7 @@
       battery: normalizeEntityId(config.entity_battery),
       progress: normalizeEntityId(config.entity_progress),
       area: normalizeEntityId(config.entity_area),
+      map_area: normalizeEntityId(config.entity_map_area),
       blade: normalizeEntityId(config.entity_blade),
       rtk: normalizeEntityId(config.entity_rtk),
       map: normalizeEntityId(config.entity_map),
@@ -243,35 +313,32 @@
       error: normalizeEntityId(config.entity_error),
       lifted: normalizeEntityId(config.entity_lifted),
       rain: normalizeEntityId(config.entity_rain),
+      headlights: normalizeEntityId(config.entity_headlights),
       btn_cancel: normalizeEntityId(config.entity_btn_cancel),
       btn_dock_cancel: normalizeEntityId(config.entity_btn_dock_cancel),
     };
 
-    if (!config.device) {
-      const out = { ...manual };
-      out.battery = resolveBatteryEntity(hass, config, out, null);
-      return out;
-    }
-
-    const devId = normalizeDeviceId(config.device);
+    const devId = resolveDeviceId(hass, config, manual.mower);
     const found = Object.fromEntries(Object.keys(ENTITY_SUFFIXES).map((k) => [k, null]));
     const registry = hass.entities || {};
 
-    for (const [eid, ent] of Object.entries(registry)) {
-      if (ent.device_id !== devId) continue;
-      const uid = ent.unique_id || "";
-      const domain = entityDomain(eid);
+    if (devId) {
+      for (const [eid, ent] of Object.entries(registry)) {
+        if (ent.device_id !== devId) continue;
+        const uid = ent.unique_id || "";
+        const domain = entityDomain(eid);
 
-      if (!found.mower && domain === "lawn_mower") {
-        found.mower = eid;
-      }
+        if (!found.mower && domain === "lawn_mower") {
+          found.mower = eid;
+        }
 
-      for (const [key, suffix] of Object.entries(ENTITY_SUFFIXES)) {
-        if (!matchesEntitySuffix(uid, key, suffix)) continue;
-        if (key === "error" && domain !== "binary_sensor") continue;
-        if (key === "mower") continue;
-        if (hass.states[eid] || key === "map") {
-          found[key] = eid;
+        for (const [key, suffix] of Object.entries(ENTITY_SUFFIXES)) {
+          if (!matchesEntitySuffix(uid, key, suffix)) continue;
+          if (key === "error" && domain !== "binary_sensor") continue;
+          if (key === "mower") continue;
+          if (canDiscoverEntity(hass, eid, key, domain)) {
+            found[key] = eid;
+          }
         }
       }
     }
@@ -281,6 +348,7 @@
       if (value) merged[key] = value;
     }
     merged.mower = manual.mower || found.mower;
+    applyMowerSlugFallbacks(hass, merged, merged.mower);
     merged.battery = resolveBatteryEntity(hass, config, merged, devId);
     return merged;
   }
@@ -319,7 +387,24 @@
   function displayStatus(hass, entities, activity, pending, cfg) {
     if (pending) return pending === "start" ? "Starting…" : pending === "pause" ? "Pausing…" : "Docking…";
     if (cfg?.state_text) return cfg.state_text;
+
+    const charging = isOn(hass, entities.charging);
+    const mowerState = String(entityState(hass, entities.mower)?.state || "").toLowerCase();
     const detail = textState(hass, entities.status, "");
+
+    if (charging || mowerState === "charging") return "Charging";
+    if (mowerState === "docked") return "Docked";
+    if (mowerState === "mowing") return "Mowing";
+    if (mowerState === "paused") return "Paused";
+    if (mowerState === "returning") return "Returning";
+    if (mowerState === "error") return "Error";
+
+    if (/^charg/i.test(detail)) return detail;
+    if (/^wait/i.test(detail)) {
+      if (charging) return "Charging";
+      if (activity === "docked") return "Docked";
+      return "Waiting";
+    }
     if (detail && detail !== "—") return detail;
     return ACTIVITY_LABELS[activity] || "Unknown";
   }
@@ -329,8 +414,18 @@
     if (activity === "mowing") return "mowing";
     if (activity === "returning") return "returning";
     if (activity === "paused") return "paused";
-    if (isOn(hass, entities.charging) || activity === "docked") return "docked";
+    if (isOn(hass, entities.charging)) return "charging";
+    if (activity === "docked") return "docked";
     return activity || "idle";
+  }
+
+  function hasLymowService(hass, service) {
+    return Boolean(hass?.services?.lymow?.[service]);
+  }
+
+  function lymowDeviceTarget(hass, config, entities) {
+    const devId = resolveDeviceId(hass, config, entities?.mower);
+    return devId ? { device_id: devId } : {};
   }
 
   function isActiveRun(activity) {
@@ -766,6 +861,66 @@
       }
     }
 
+    _canCancelTask(cfg, entities) {
+      return Boolean(entities.btn_cancel || hasLymowService(this.hass, "cancel_task"));
+    }
+
+    _canDockCancel(cfg, entities) {
+      return Boolean(entities.btn_dock_cancel || hasLymowService(this.hass, "dock_cancel_task"));
+    }
+
+    async _cancelTask(cfg, entities) {
+      if (this._busy) return;
+      this._busy = true;
+      try {
+        if (entities.btn_cancel) {
+          await this._call("button", "press", { entity_id: entities.btn_cancel });
+        } else if (hasLymowService(this.hass, "cancel_task")) {
+          await this._call("lymow", "cancel_task", lymowDeviceTarget(this.hass, cfg, entities));
+        }
+      } finally {
+        this._busy = false;
+      }
+    }
+
+    async _dockCancelTask(cfg, entities) {
+      if (this._busy) return;
+      this._busy = true;
+      this._pending = "dock";
+      try {
+        if (entities.btn_dock_cancel) {
+          await this._call("button", "press", { entity_id: entities.btn_dock_cancel });
+        } else if (hasLymowService(this.hass, "dock_cancel_task")) {
+          await this._call("lymow", "dock_cancel_task", lymowDeviceTarget(this.hass, cfg, entities));
+        }
+      } finally {
+        this._busy = false;
+      }
+    }
+
+    async _dockAction(cfg, entities, activity) {
+      if (this._busy) return;
+      if (activity === "mowing" || activity === "paused" || activity === "returning") {
+        await this._mowerAction("dock");
+        return;
+      }
+      await this._dockCancelTask(cfg, entities);
+    }
+
+    async _toggleHeadlights(entities) {
+      const eid = entities.headlights;
+      if (!eid || this._busy) return;
+      const st = entityState(this.hass, eid);
+      if (!st || st.state === "unavailable" || st.state === "unknown") return;
+      this._busy = true;
+      try {
+        const service = st.state === "on" ? "turn_off" : "turn_on";
+        await this._call("switch", service, { entity_id: eid });
+      } finally {
+        this._busy = false;
+      }
+    }
+
     async _setMowMode(entityId, option) {
       if (!entityId || !option || this._busy) return;
       this._busy = true;
@@ -826,13 +981,20 @@
     }
 
     _renderStats(hass, entities) {
-      const area = textState(hass, entities.area, "");
-      const blade = textState(hass, entities.blade, "");
-      const rtk = textState(hass, entities.rtk, "");
       const items = [];
-      if (area && area !== "—") items.push({ label: "Area", value: `${area} m²` });
-      if (blade && blade !== "—") items.push({ label: "Height", value: `${blade} mm` });
-      if (rtk && rtk !== "—") items.push({ label: "RTK", value: rtk });
+      const areaEntity = entities.area || entities.map_area;
+      const areaLabel = entities.area ? "Area" : entities.map_area ? "Map" : "Area";
+      const area = textState(hass, areaEntity, "");
+      if (areaEntity && area && area !== "—") {
+        items.push({ label: areaLabel, value: `${area} m²` });
+      }
+      if (entities.blade) {
+        const blade = textState(hass, entities.blade, "—");
+        items.push({ label: "Height", value: blade === "—" ? blade : `${blade} mm` });
+      }
+      if (entities.rtk) {
+        items.push({ label: "RTK", value: textState(hass, entities.rtk, "—") });
+      }
       if (!items.length) return nothing;
       return html`
         <div class="stats">
@@ -845,6 +1007,30 @@
             `
           )}
         </div>
+      `;
+    }
+
+    _renderHeadlights(hass, entities) {
+      const eid = entities.headlights;
+      if (!eid) return nothing;
+      const st = entityState(hass, eid);
+      const on = st?.state === "on";
+      const unavailable = !st || st.state === "unavailable" || st.state === "unknown";
+      return html`
+        <button
+          type="button"
+          class="headlights-btn ${on ? "on" : ""}"
+          ?disabled=${this._busy || unavailable}
+          title=${on ? "Headlights on" : "Headlights off"}
+          @click=${() => this._toggleHeadlights(entities)}
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path
+              fill="currentColor"
+              d="M5.5 7.5A6.5 6.5 0 0 1 12 1a6.5 6.5 0 0 1 6.5 6.5c0 .74-.12 1.45-.35 2.11l2.14 2.14a1 1 0 0 1-1.42 1.42l-1.36-1.36A6.47 6.47 0 0 1 12 14a6.5 6.5 0 0 1-6.5-6.5m0 2A4.5 4.5 0 0 0 12 12a4.5 4.5 0 0 0 4.5-4.5A4.5 4.5 0 0 0 12 3 4.5 4.5 0 0 0 7.5 7.5M2 20v-2h4.75l-1.4-3.5 1.86-1.86L9.83 18H22v2H2Z"
+            />
+          </svg>
+        </button>
       `;
     }
 
@@ -1127,6 +1313,7 @@
               </div>
               <div class="header-right">
                 ${this._renderBattery(batt, charging)}
+                ${cfg.show_headlights !== false ? this._renderHeadlights(this.hass, entities) : nothing}
                 ${this._onlineIcon(online)}
               </div>
             </div>
@@ -1156,8 +1343,8 @@
               </button>
               <button
                 class="act dock-btn"
-                ?disabled=${this._busy || !canDock(features) || activity === "docked"}
-                @click=${() => this._mowerAction("dock")}
+                ?disabled=${this._busy || activity === "docked" || (!canDock(features) && !this._canDockCancel(cfg, entities))}
+                @click=${() => this._dockAction(cfg, entities, activity)}
               >
                 Dock
               </button>
@@ -1168,15 +1355,15 @@
                   <div class="actions secondary">
                     <button
                       class="act ghost"
-                      ?disabled=${this._busy || !entities.btn_cancel}
-                      @click=${() => this._pressButton(entities.btn_cancel)}
+                      ?disabled=${this._busy || !this._canCancelTask(cfg, entities)}
+                      @click=${() => this._cancelTask(cfg, entities)}
                     >
                       Cancel task
                     </button>
                     <button
                       class="act ghost"
-                      ?disabled=${this._busy || !entities.btn_dock_cancel}
-                      @click=${() => this._pressButton(entities.btn_dock_cancel)}
+                      ?disabled=${this._busy || !this._canDockCancel(cfg, entities)}
+                      @click=${() => this._dockCancelTask(cfg, entities)}
                     >
                       Dock & cancel
                     </button>
@@ -1242,6 +1429,32 @@
           align-items: center;
           gap: 8px;
           flex-shrink: 0;
+        }
+        .headlights-btn {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          width: 32px;
+          height: 32px;
+          padding: 0;
+          border: 1px solid var(--divider-color, rgba(255, 255, 255, 0.12));
+          border-radius: 8px;
+          background: var(--secondary-background-color);
+          color: var(--secondary-text-color);
+          cursor: pointer;
+        }
+        .headlights-btn.on {
+          color: #fde047;
+          border-color: rgba(253, 224, 71, 0.45);
+          background: rgba(253, 224, 71, 0.12);
+        }
+        .headlights-btn:disabled {
+          opacity: 0.45;
+          cursor: not-allowed;
+        }
+        .headlights-btn svg {
+          width: 18px;
+          height: 18px;
         }
         .battery {
           display: flex;
@@ -1441,6 +1654,10 @@
         }
         .state-pill.docked .dot {
           background: #f97316;
+        }
+        .state-pill.charging .dot {
+          background: #22c55e;
+          animation: pulse 2s ease-in-out infinite;
         }
         .state-pill.paused .dot {
           background: #eab308;
@@ -1689,6 +1906,10 @@
             { name: "entity_battery", selector: { entity: { domain: "sensor" } } },
             { name: "entity_progress", selector: { entity: { domain: "sensor" } } },
             { name: "entity_area", selector: { entity: { domain: "sensor" } } },
+            { name: "entity_blade", selector: { entity: { domain: "sensor" } } },
+            { name: "entity_rtk", selector: { entity: { domain: "sensor" } } },
+            { name: "entity_charging", selector: { entity: { domain: "binary_sensor" } } },
+            { name: "entity_headlights", selector: { entity: { domain: "switch" } } },
             { name: "entity_map", selector: { entity: { domain: "camera" } } },
             { name: "entity_map_geojson", selector: { entity: { domain: "sensor" } } },
             { name: "entity_mow_mode", selector: { entity: { domain: "select" } } },
@@ -1714,6 +1935,7 @@
             { name: "show_mow_mode", selector: { boolean: {} } },
             { name: "show_zone_picker", selector: { boolean: {} } },
             { name: "show_secondary_actions", selector: { boolean: {} } },
+            { name: "show_headlights", selector: { boolean: {} } },
             { name: "image_mower", selector: { text: {} } },
             { name: "image_dock", selector: { text: {} } },
             {
@@ -1729,6 +1951,10 @@
               entity_battery: "Battery sensor",
               entity_progress: "Session progress sensor",
               entity_area: "Session area sensor",
+              entity_blade: "Blade height sensor",
+              entity_rtk: "RTK GPS sensor",
+              entity_charging: "Charging binary sensor",
+              entity_headlights: "Headlights switch",
               entity_map: "Map camera",
               entity_map_geojson: "Map GeoJSON sensor (zone list)",
               entity_mow_mode: "Mow mode select",
@@ -1743,6 +1969,7 @@
               show_mow_mode: "Show mow pattern selector",
               show_zone_picker: "Show zone picker (Start selected zones)",
               show_secondary_actions: "Show cancel / dock & cancel buttons",
+              show_headlights: "Show headlights toggle in header",
               image_mower: "Away image URL — empty dock while mowing (/local/…)",
               image_dock: "Docked image URL — robot on station (/local/…)",
               map_refresh_seconds: "Map refresh interval (seconds)",
