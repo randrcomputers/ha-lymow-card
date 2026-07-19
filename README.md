@@ -4,7 +4,8 @@ Lovelace card built for the **[Lymow-HA](https://github.com/d3dfantasy99/Lymow-H
 
 Replaces generic cards like [compact-lawn-mower-card](https://github.com/Tra1n84/compact-lawn-mower-card) with entity wiring and UI specific to Lymow.
 
-<img width="490" height="571" alt="image" src="https://github.com/user-attachments/assets/fccf489a-1408-46c1-8f3b-01d52654abf0" />
+<img width="490" height="576" alt="image" src="https://github.com/user-attachments/assets/a2f4589b-d7f2-4b21-b483-b35dea48494e" />
+
 
 ## Features
 
