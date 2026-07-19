@@ -645,15 +645,41 @@
 
   const WGS84_A = 6378137;
 
+  function ringLooksLikeEnu(ring) {
+    if (!ring?.length) return false;
+    let minX = Infinity;
+    let maxX = -Infinity;
+    for (const [x] of ring) {
+      minX = Math.min(minX, x);
+      maxX = Math.max(maxX, x);
+    }
+    return maxX - minX > 2;
+  }
+
+  function ringToEnu(ring, feature, attrs) {
+    const ebp = attrs?.enu_base_point || {};
+    const lat0 = Number(ebp.latitude);
+    const lon0 = Number(ebp.longitude);
+    const hasOrigin =
+      attrs?.has_gps_origin && Number.isFinite(lat0) && Number.isFinite(lon0);
+    const mode = ringCoordMode(feature);
+    if (mode === "enu" || ringLooksLikeEnu(ring)) return ring;
+    if (hasOrigin) return latLonRingToEnu(ring, lat0, lon0);
+    return ring;
+  }
+
   /** Match Lymow-HA build_map_png: uniform scale, PAD, Y-flip. */
   function lymowMapProjection(renderDebug, ringBounds) {
     const W = 100;
     const H = 100;
     const PAD = 5;
-    const min_x = renderDebug?.min_x ?? ringBounds?.minX;
-    const max_x = renderDebug?.max_x ?? ringBounds?.maxX;
-    const min_y = renderDebug?.min_y ?? ringBounds?.minY;
-    const max_y = renderDebug?.max_y ?? ringBounds?.maxY;
+    const dbgValid = ["min_x", "max_x", "min_y", "max_y"].every((k) =>
+      Number.isFinite(renderDebug?.[k])
+    );
+    const min_x = dbgValid ? renderDebug.min_x : ringBounds?.minX;
+    const max_x = dbgValid ? renderDebug.max_x : ringBounds?.maxX;
+    const min_y = dbgValid ? renderDebug.min_y : ringBounds?.minY;
+    const max_y = dbgValid ? renderDebug.max_y : ringBounds?.maxY;
     if (![min_x, max_x, min_y, max_y].every(Number.isFinite)) return null;
     const scale = (W - PAD * 2) / Math.max(max_x - min_x || 1, max_y - min_y || 1);
     return {
@@ -713,12 +739,6 @@
       features = attrs.geojson.features;
     }
 
-    const ebp = attrs.enu_base_point || {};
-    const lat0 = Number(ebp.latitude);
-    const lon0 = Number(ebp.longitude);
-    const hasOrigin =
-      attrs.has_gps_origin && Number.isFinite(lat0) && Number.isFinite(lon0);
-
     const zones = [];
     const seen = new Set();
     for (const f of features) {
@@ -734,9 +754,7 @@
         .filter((pt) => Number.isFinite(pt[0]) && Number.isFinite(pt[1]));
       if (ring.length < 3) continue;
 
-      if (hasOrigin && ringCoordMode(f) !== "enu") {
-        ring = latLonRingToEnu(ring, lat0, lon0);
-      }
+      ring = ringToEnu(ring, f, attrs);
 
       seen.add(id);
       const index = zones.length;
@@ -1247,6 +1265,7 @@
 
     _renderMapZoneOverlay(zoneFeatures, selected, projection) {
       if (!zoneFeatures?.length || !projection || !selected?.size) return nothing;
+      const picked = zoneFeatures.filter((z) => selected.has(z.id));
       return html`
         <svg class="zone-overlay" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
           ${zoneFeatures.map((z) => {
@@ -1254,26 +1273,60 @@
             const on = selected.has(z.id);
             const [cx, cy] = projection.toPoint(...ringCentroid(z.ring));
             return html`
-              ${!on
-                ? html`<polygon points=${pts} class="zone-dim"></polygon>`
-                : nothing}
+              ${!on ? html`<polygon points=${pts} class="zone-dim"></polygon>` : nothing}
               ${on
                 ? html`
                     <polygon points=${pts} class="zone-glow"></polygon>
                     <polygon points=${pts} class="zone-selected"></polygon>
-                    <circle class="zone-check-bg" cx=${cx.toFixed(2)} cy=${cy.toFixed(2)} r="4.2"></circle>
+                    <circle class="zone-check-bg" cx=${cx.toFixed(2)} cy=${cy.toFixed(2)} r="4.8"></circle>
                     <path
                       class="zone-check-mark"
-                      d="M ${(cx - 1.8).toFixed(2)} ${cy.toFixed(2)} L ${(cx - 0.4).toFixed(2)} ${(cy + 1.4).toFixed(2)} L ${(cx + 2.2).toFixed(2)} ${(cy - 1.6).toFixed(2)}"
+                      d="M ${(cx - 2).toFixed(2)} ${cy.toFixed(2)} L ${(cx - 0.5).toFixed(2)} ${(cy + 1.6).toFixed(2)} L ${(cx + 2.4).toFixed(2)} ${(cy - 1.8).toFixed(2)}"
                     ></path>
                   `
                 : nothing}
-              <text x=${cx.toFixed(2)} y=${(cy + (on ? 7.5 : 3)).toFixed(2)} class="zone-label ${on ? "on" : ""}">
+              <text x=${cx.toFixed(2)} y=${(cy + (on ? 8 : 3.5)).toFixed(2)} class="zone-label ${on ? "on" : ""}">
                 ${z.shortLabel || z.name}
               </text>
             `;
           })}
         </svg>
+        ${picked.length === 0
+          ? html`<div class="zone-overlay-warn">Zone shapes not matched — see preview below</div>`
+          : nothing}
+      `;
+    }
+
+    _renderZonePreviewSvg(zoneFeatures, selected, projection) {
+      if (!selected?.size || !zoneFeatures?.length || !projection) return nothing;
+      return html`
+        <div class="zone-preview">
+          <div class="zone-preview-label">Selected zones preview</div>
+          <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+            ${zoneFeatures.map((z) => {
+              const on = selected.has(z.id);
+              const pts = projection.toPoints(z.ring);
+              const [cx, cy] = projection.toPoint(...ringCentroid(z.ring));
+              return html`
+                ${!on ? html`<polygon points=${pts} class="dimmed"></polygon>` : nothing}
+                ${on
+                  ? html`
+                      <polygon points=${pts} class="zone-glow"></polygon>
+                      <polygon points=${pts} class="selected"></polygon>
+                      <circle class="zone-check-bg" cx=${cx.toFixed(2)} cy=${cy.toFixed(2)} r="4.8"></circle>
+                      <path
+                        class="zone-check-mark"
+                        d="M ${(cx - 2).toFixed(2)} ${cy.toFixed(2)} L ${(cx - 0.5).toFixed(2)} ${(cy + 1.6).toFixed(2)} L ${(cx + 2.4).toFixed(2)} ${(cy - 1.8).toFixed(2)}"
+                      ></path>
+                    `
+                  : nothing}
+                <text x=${cx.toFixed(2)} y=${(cy + (on ? 8 : 3.5)).toFixed(2)} class="zone-label ${on ? "on" : ""}">
+                  ${z.shortLabel || z.name}
+                </text>
+              `;
+            })}
+          </svg>
+        </div>
       `;
     }
 
@@ -1329,16 +1382,19 @@
       return html`
         <div class="hero map-hero ${phase}">
           <div class="map-stack">
-            <img
-              src=${src}
-              alt="Lymow map"
-              draggable="false"
-              @error=${this._onMapError}
-            />
-            ${highlightZones
-              ? this._renderMapZoneOverlay(zoneFeatures, selected, projection)
-              : nothing}
+            <div class="map-frame">
+              <img
+                src=${src}
+                alt="Lymow map"
+                draggable="false"
+                @error=${this._onMapError}
+              />
+              ${highlightZones
+                ? this._renderMapZoneOverlay(zoneFeatures, selected, projection)
+                : nothing}
+            </div>
           </div>
+          ${highlightZones ? this._renderZonePreviewSvg(zoneFeatures, selected, projection) : nothing}
           <div class="map-badge">Live map</div>
         </div>
       `;
@@ -1711,17 +1767,20 @@
           border-radius: 8px;
         }
         .map-stack {
-          position: relative;
           display: flex;
-          align-items: center;
           justify-content: center;
           width: 100%;
+        }
+        .map-frame {
+          position: relative;
+          width: min(100%, 160px);
+          aspect-ratio: 1;
           max-height: 160px;
         }
-        .map-stack img {
+        .map-frame img {
           display: block;
           width: 100%;
-          max-height: 160px;
+          height: 100%;
           object-fit: contain;
           border-radius: 8px;
         }
@@ -1730,10 +1789,57 @@
           inset: 0;
           width: 100%;
           height: 100%;
-          max-height: 160px;
           pointer-events: none;
           overflow: visible;
           z-index: 2;
+        }
+        .zone-overlay-warn {
+          position: absolute;
+          left: 4px;
+          right: 4px;
+          bottom: 4px;
+          padding: 3px 6px;
+          border-radius: 6px;
+          font-size: 0.62rem;
+          text-align: center;
+          color: #fde68a;
+          background: rgba(0, 0, 0, 0.65);
+          z-index: 3;
+        }
+        .zone-preview {
+          margin-top: 6px;
+          padding: 6px;
+          border-radius: 8px;
+          background: var(--secondary-background-color);
+        }
+        .zone-preview-label {
+          font-size: 0.68rem;
+          font-weight: 600;
+          color: var(--secondary-text-color);
+          margin-bottom: 4px;
+          text-align: center;
+        }
+        .zone-preview svg {
+          display: block;
+          width: 100%;
+          max-height: 110px;
+          background: radial-gradient(circle at 50% 45%, #14532d 0%, #0f172a 72%);
+          border-radius: 6px;
+        }
+        .zone-preview .dimmed {
+          fill: rgba(0, 0, 0, 0.22);
+          stroke: rgba(255, 255, 255, 0.1);
+          stroke-width: 0.35;
+        }
+        .zone-preview .selected {
+          fill: rgba(37, 99, 235, 0.55);
+          stroke: #ffffff;
+          stroke-width: 1.6;
+        }
+        .zone-preview .zone-glow {
+          fill: rgba(59, 130, 246, 0.28);
+          stroke: rgba(147, 197, 253, 0.95);
+          stroke-width: 2.4;
         }
         .zone-overlay .zone-dim {
           fill: rgba(15, 23, 42, 0.45);
