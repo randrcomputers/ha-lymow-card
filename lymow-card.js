@@ -678,6 +678,78 @@
     return { lat0, lon0 };
   }
 
+  function renderDebugReady(renderDebug) {
+    return (
+      renderDebug &&
+      ["min_x", "max_x", "min_y", "max_y"].every((k) => Number.isFinite(renderDebug[k]))
+    );
+  }
+
+  function computeWgs84Bounds(rings) {
+    let minLon = Infinity;
+    let maxLon = -Infinity;
+    let minLat = Infinity;
+    let maxLat = -Infinity;
+    let count = 0;
+    for (const ring of rings) {
+      if (!ringLooksLikeWgs84(ring)) continue;
+      for (const [lon, lat] of ring) {
+        minLon = Math.min(minLon, lon);
+        maxLon = Math.max(maxLon, lon);
+        minLat = Math.min(minLat, lat);
+        maxLat = Math.max(maxLat, lat);
+        count += 1;
+      }
+    }
+    if (!count || !Number.isFinite(minLon)) return null;
+    return { minLon, maxLon, minLat, maxLat };
+  }
+
+  /** Map WGS84 rings directly onto map camera ENU bounds (property-scale accurate). */
+  function mapWgs84RingToRenderEnu(ring, wgsBounds, renderDebug) {
+    const lonSpan = wgsBounds.maxLon - wgsBounds.minLon || 1e-9;
+    const latSpan = wgsBounds.maxLat - wgsBounds.minLat || 1e-9;
+    const xSpan = renderDebug.max_x - renderDebug.min_x;
+    const ySpan = renderDebug.max_y - renderDebug.min_y;
+    return ring.map(([lon, lat]) => [
+      renderDebug.min_x + ((lon - wgsBounds.minLon) / lonSpan) * xSpan,
+      renderDebug.min_y + ((lat - wgsBounds.minLat) / latSpan) * ySpan,
+    ]);
+  }
+
+  function mergeGeoAttrs(geoAttrs, mapAttrs) {
+    const geo = geoAttrs || {};
+    const map = mapAttrs || {};
+    return {
+      ...geo,
+      has_gps_origin: gpsOriginReady(geo) || map.has_enu_base_point === true,
+      enu_base_point: geo.enu_base_point || map.enu_base_point || null,
+    };
+  }
+
+  function convertRingForMap(rawRing, feature, attrs, renderDebug, wgsBounds) {
+    if (renderDebugReady(renderDebug) && wgsBounds && ringLooksLikeWgs84(rawRing)) {
+      return mapWgs84RingToRenderEnu(rawRing, wgsBounds, renderDebug);
+    }
+    return resolveZoneRing(rawRing, feature, attrs, renderDebug);
+  }
+
+  function ringProjectsToView(projection, ring) {
+    if (!projection || !ring?.length) return false;
+    for (const [x, y] of ring) {
+      const [nx, ny] = projection.toPoint(x, y);
+      if (Number.isFinite(nx) && Number.isFinite(ny) && nx >= -5 && nx <= 105 && ny >= -5 && ny <= 105) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function zonesProjectToView(zones, projection) {
+    if (!zones?.length || !projection) return false;
+    return zones.some((z) => ringProjectsToView(projection, z.ring));
+  }
+
   function ringMatchesMapBounds(ring, renderDebug) {
     if (!renderDebug || !ring?.length) return false;
     const keys = ["min_x", "max_x", "min_y", "max_y"];
@@ -868,41 +940,47 @@
 
   /** Zone polygons aligned to Lymow map camera (ENU + render_debug). */
   function loadZoneFeatures(hass, entityId, mapEntityId) {
-    const st = entityState(hass, entityId);
+    const st = entityId ? entityState(hass, entityId) : null;
     if (!st?.attributes) return { zones: [], overlayProjection: null };
 
     const mapSt = mapEntityId ? entityState(hass, mapEntityId) : null;
     const renderDebug = mapSt?.attributes?.render_debug || null;
+    const attrs = mergeGeoAttrs(st.attributes, mapSt?.attributes);
 
-    const attrs = st.attributes;
     let features =
       featureCollectionFeatures(attrs.geojson_zones) ||
       featureCollectionFeatures(attrs.geojson) ||
       [];
 
-    const zones = [];
-    const seen = new Set();
+    const pending = [];
     for (const f of features) {
       const p = f?.properties || {};
       if (p.type && p.type !== "zone") continue;
       const id = p.hashId || p.hash_id || p.id;
-      if (!id || seen.has(id)) continue;
+      if (!id) continue;
       const geom = f.geometry;
       if (!geom || geom.type !== "Polygon" || !geom.coordinates?.[0]?.length) continue;
 
-      let ring = geom.coordinates[0]
+      const rawRing = geom.coordinates[0]
         .map((pt) => [Number(pt[0]), Number(pt[1])])
         .filter((pt) => Number.isFinite(pt[0]) && Number.isFinite(pt[1]));
-      if (ring.length < 3) continue;
+      if (rawRing.length < 3) continue;
+      pending.push({ f, p, id: String(id), rawRing });
+    }
 
-      ring = resolveZoneRing(ring, f, attrs, renderDebug);
+    const wgsBounds = computeWgs84Bounds(pending.map((item) => item.rawRing));
 
-      seen.add(id);
+    const zones = [];
+    const seen = new Set();
+    for (const item of pending) {
+      if (seen.has(item.id)) continue;
+      let ring = convertRingForMap(item.rawRing, item.f, attrs, renderDebug, wgsBounds);
+      seen.add(item.id);
       const index = zones.length;
-      const name = zoneDisplayName(p, String(id), index);
+      const name = zoneDisplayName(item.p, item.id, index);
       const zoneNum = name.match(/^Zone\s+(\d+)$/i);
       zones.push({
-        id: String(id),
+        id: item.id,
         name,
         shortLabel: zoneNum ? zoneNum[1] : name.slice(0, 8),
         index,
@@ -917,9 +995,37 @@
       return a.index - b.index;
     });
 
-    const alignedZones = alignZonesToMapBounds(zones, renderDebug);
-    const ringBounds = zoneFeatureBounds(alignedZones);
-    const overlayProjection = pickOverlayProjection(renderDebug, ringBounds);
+    let alignedZones = alignZonesToMapBounds(zones, renderDebug);
+    let ringBounds = zoneFeatureBounds(alignedZones);
+    let overlayProjection = pickOverlayProjection(renderDebug, ringBounds);
+
+    if (
+      overlayProjection &&
+      !zonesProjectToView(alignedZones, overlayProjection) &&
+      wgsBounds &&
+      renderDebugReady(renderDebug)
+    ) {
+      alignedZones = pending.map((item, index) => {
+        const name = zoneDisplayName(item.p, item.id, index);
+        const zoneNum = name.match(/^Zone\s+(\d+)$/i);
+        return {
+          id: item.id,
+          name,
+          shortLabel: zoneNum ? zoneNum[1] : name.slice(0, 8),
+          index,
+          ring: mapWgs84RingToRenderEnu(item.rawRing, wgsBounds, renderDebug),
+        };
+      });
+      alignedZones.sort((a, b) => {
+        const na = a.name.match(/^Zone\s+(\d+)$/i);
+        const nb = b.name.match(/^Zone\s+(\d+)$/i);
+        if (na && nb) return Number(na[1]) - Number(nb[1]);
+        return a.index - b.index;
+      });
+      ringBounds = zoneFeatureBounds(alignedZones);
+      overlayProjection = pickOverlayProjection(renderDebug, ringBounds);
+    }
+
     return { zones: alignedZones, overlayProjection };
   }
 
@@ -1423,32 +1529,59 @@
 
     _renderMapZoneOverlay(zoneFeatures, selected, projection) {
       if (!zoneFeatures?.length || !projection || !selected?.size) return nothing;
+      const shapes = [];
+      for (const z of zoneFeatures) {
+        const pts = projection.toPoints(z.ring);
+        if (!pts || pts.includes("NaN")) continue;
+        const on = zoneIsSelected(z, selected);
+        const [cx, cy] = projection.toPoint(...ringCentroid(z.ring));
+        if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
+        shapes.push({ z, pts, on, cx, cy });
+      }
+      if (!shapes.length) return nothing;
+
       return html`
-        <svg class="zone-overlay" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
-          ${zoneFeatures.map((z) => {
-            const pts = projection.toPoints(z.ring);
-            if (!pts || pts.includes("NaN")) return nothing;
-            const on = zoneIsSelected(z, selected);
-            const [cx, cy] = projection.toPoint(...ringCentroid(z.ring));
-            return html`
-              <polygon points=${pts} class="zone-outline"></polygon>
-              ${!on ? html`<polygon points=${pts} class="zone-dim"></polygon>` : nothing}
-              ${on
-                ? html`
-                    <polygon points=${pts} class="zone-glow"></polygon>
-                    <polygon points=${pts} class="zone-selected"></polygon>
-                    <circle class="zone-check-bg" cx=${cx.toFixed(2)} cy=${cy.toFixed(2)} r="4.8"></circle>
-                    <path
-                      class="zone-check-mark"
-                      d="M ${(cx - 2).toFixed(2)} ${cy.toFixed(2)} L ${(cx - 0.5).toFixed(2)} ${(cy + 1.6).toFixed(2)} L ${(cx + 2.4).toFixed(2)} ${(cy - 1.8).toFixed(2)}"
-                    ></path>
-                  `
-                : nothing}
-              <text x=${cx.toFixed(2)} y=${(cy + (on ? 8 : 3.5)).toFixed(2)} class="zone-label ${on ? "on" : ""}">
-                ${z.shortLabel || z.name}
-              </text>
-            `;
-          })}
+        <svg
+          class="zone-overlay"
+          viewBox="0 0 100 100"
+          preserveAspectRatio="xMidYMid meet"
+          aria-hidden="true"
+        >
+          ${shapes.map(({ z, pts, on, cx, cy }) => html`
+            <polygon
+              .points=${pts}
+              fill=${on ? "rgba(21, 128, 61, 0.85)" : "rgba(0, 0, 0, 0.55)"}
+              stroke=${on ? "#14532d" : "rgba(255, 255, 255, 0.4)"}
+              stroke-width=${on ? "2" : "0.8"}
+              stroke-linejoin="round"
+            ></polygon>
+            ${on
+              ? html`
+                  <circle cx=${cx.toFixed(2)} cy=${cy.toFixed(2)} r="4.5" fill="#14532d" stroke="#ecfdf5" stroke-width="0.8"></circle>
+                  <path
+                    fill="none"
+                    stroke="#ecfdf5"
+                    stroke-width="1.4"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    d="M ${(cx - 2).toFixed(2)} ${cy.toFixed(2)} L ${(cx - 0.5).toFixed(2)} ${(cy + 1.6).toFixed(2)} L ${(cx + 2.4).toFixed(2)} ${(cy - 1.8).toFixed(2)}"
+                  ></path>
+                `
+              : nothing}
+            <text
+              x=${cx.toFixed(2)}
+              y=${(cy + (on ? 8 : 3.5)).toFixed(2)}
+              fill=${on ? "#ecfdf5" : "rgba(255,255,255,0.85)"}
+              font-size=${on ? "5" : "4.5"}
+              font-weight="700"
+              text-anchor="middle"
+              stroke="rgba(0,0,0,0.8)"
+              stroke-width="0.55"
+              paint-order="stroke fill"
+            >
+              ${z.shortLabel || z.name}
+            </text>
+          `)}
         </svg>
       `;
     }
@@ -1884,6 +2017,9 @@
           display: block;
           border-radius: 8px;
         }
+        .map-hero.hero {
+          overflow: visible;
+        }
         .map-hero {
           display: flex;
           flex-direction: column;
@@ -1899,6 +2035,7 @@
           width: min(100%, 160px);
           aspect-ratio: 1;
           max-height: 160px;
+          overflow: visible;
         }
         .map-frame img {
           display: block;
@@ -1914,54 +2051,7 @@
           height: 100%;
           pointer-events: none;
           overflow: visible;
-          z-index: 2;
-        }
-        .zone-overlay .zone-outline {
-          fill: none;
-          stroke: rgba(255, 255, 255, 0.55);
-          stroke-width: 0.45;
-        }
-        .zone-overlay .zone-dim {
-          fill: rgba(0, 0, 0, 0.48);
-          stroke: rgba(255, 255, 255, 0.2);
-          stroke-width: 0.45;
-        }
-        .zone-overlay .zone-glow {
-          fill: rgba(22, 101, 52, 0.38);
-          stroke: rgba(74, 222, 128, 0.95);
-          stroke-width: 2.2;
-        }
-        .zone-overlay .zone-selected {
-          fill: rgba(21, 128, 61, 0.78);
-          stroke: #14532d;
-          stroke-width: 1.8;
-        }
-        .zone-overlay .zone-check-bg {
-          fill: #14532d;
-          stroke: #bbf7d0;
-          stroke-width: 0.7;
-        }
-        .zone-overlay .zone-check-mark {
-          fill: none;
-          stroke: #ecfdf5;
-          stroke-width: 1.3;
-          stroke-linecap: round;
-          stroke-linejoin: round;
-        }
-        .zone-overlay .zone-label {
-          fill: rgba(255, 255, 255, 0.88);
-          font-size: 4.5px;
-          font-weight: 700;
-          text-anchor: middle;
-          paint-order: stroke fill;
-          stroke: rgba(0, 0, 0, 0.75);
-          stroke-width: 0.55;
-        }
-        .zone-overlay .zone-label.on {
-          fill: #ecfdf5;
-          font-size: 5px;
-          stroke: rgba(20, 83, 45, 0.95);
-          stroke-width: 0.7;
+          z-index: 3;
         }
         .geo-hero .dimmed {
           fill: rgba(0, 0, 0, 0.22);
