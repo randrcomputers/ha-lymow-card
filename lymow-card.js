@@ -703,21 +703,21 @@
   }
 
   /** Match Lymow-HA build_map_png: uniform scale, PAD, Y-flip. */
-  function lymowMapProjection(renderDebug, ringBounds, preferDebug = true) {
+  function lymowMapProjection(renderDebug, ringBounds) {
     const W = 100;
     const H = 100;
     const PAD = 5;
-    const dbgValid =
-      preferDebug &&
-      projectionBoundsMatch(renderDebug, ringBounds) &&
-      ["min_x", "max_x", "min_y", "max_y"].every((k) => Number.isFinite(renderDebug?.[k]));
-    const min_x = dbgValid ? renderDebug.min_x : ringBounds?.minX;
-    const max_x = dbgValid ? renderDebug.max_x : ringBounds?.maxX;
-    const min_y = dbgValid ? renderDebug.min_y : ringBounds?.minY;
-    const max_y = dbgValid ? renderDebug.max_y : ringBounds?.maxY;
+    const dbgOk = ["min_x", "max_x", "min_y", "max_y"].every((k) =>
+      Number.isFinite(renderDebug?.[k])
+    );
+    const min_x = dbgOk ? renderDebug.min_x : ringBounds?.minX;
+    const max_x = dbgOk ? renderDebug.max_x : ringBounds?.maxX;
+    const min_y = dbgOk ? renderDebug.min_y : ringBounds?.minY;
+    const max_y = dbgOk ? renderDebug.max_y : ringBounds?.maxY;
     if (![min_x, max_x, min_y, max_y].every(Number.isFinite)) return null;
     const scale = (W - PAD * 2) / Math.max(max_x - min_x || 1, max_y - min_y || 1);
     return {
+      usesMapBounds: dbgOk,
       toPoint(x, y) {
         return [(x - min_x) * scale + PAD, H - ((y - min_y) * scale + PAD)];
       },
@@ -730,6 +730,15 @@
           .join(" ");
       },
     };
+  }
+
+  /** Prefer map camera bounds when they match zone rings; else fit rings only. */
+  function pickOverlayProjection(renderDebug, ringBounds) {
+    const ringProj = lymowMapProjection(null, ringBounds);
+    if (!renderDebug || !projectionBoundsMatch(renderDebug, ringBounds)) {
+      return ringProj;
+    }
+    return lymowMapProjection(renderDebug, ringBounds) || ringProj;
   }
 
   function zoneIsSelected(zone, selected) {
@@ -770,7 +779,7 @@
   /** Zone polygons aligned to Lymow map camera (ENU + render_debug). */
   function loadZoneFeatures(hass, entityId, mapEntityId) {
     const st = entityState(hass, entityId);
-    if (!st?.attributes) return { zones: [], projection: null, schematicProjection: null };
+    if (!st?.attributes) return { zones: [], overlayProjection: null };
 
     const mapSt = mapEntityId ? entityState(hass, mapEntityId) : null;
     const renderDebug = mapSt?.attributes?.render_debug || null;
@@ -821,9 +830,8 @@
     });
 
     const ringBounds = zoneFeatureBounds(zones);
-    const schematicProjection = lymowMapProjection(null, ringBounds, false);
-    const projection = lymowMapProjection(renderDebug, ringBounds, true) || schematicProjection;
-    return { zones, projection, schematicProjection };
+    const overlayProjection = pickOverlayProjection(renderDebug, ringBounds);
+    return { zones, overlayProjection };
   }
 
   function zoneFeatureBounds(zoneFeatures) {
@@ -842,7 +850,7 @@
     if (!Number.isFinite(minX)) return null;
     const width = maxX - minX || 1;
     const height = maxY - minY || 1;
-    return { minX, minY, width, height, pad: 4 };
+    return { minX, minY, maxX, maxY, width, height, pad: 4 };
   }
 
   /** Zone list from Map GeoJSON sensor (Lymow-HA). */
@@ -932,11 +940,13 @@
       if (next.has(zoneId)) next.delete(zoneId);
       else next.add(zoneId);
       this._selectedZones = next;
+      this._mapFailed = false;
       this.requestUpdate();
     }
 
     _clearZoneSelection() {
       this._selectedZones = new Set();
+      this._mapFailed = false;
       this.requestUpdate();
     }
 
@@ -1340,46 +1350,8 @@
       `;
     }
 
-    _renderZonePreviewSvg(zoneFeatures, selected, schematicProjection) {
-      const proj = schematicProjection || null;
-      if (!selected?.size || !zoneFeatures?.length || !proj) return nothing;
-      return html`
-        <div class="zone-preview">
-          <div class="zone-preview-label">Selected zones preview</div>
-          <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
-            ${zoneFeatures.map((z) => {
-              const pts = proj.toPoints(z.ring);
-              if (!pts || pts.includes("NaN")) return nothing;
-              const on = zoneIsSelected(z, selected);
-              const [cx, cy] = proj.toPoint(...ringCentroid(z.ring));
-              return html`
-                <polygon points=${pts} class="idle-outline"></polygon>
-                ${!on ? html`<polygon points=${pts} class="dimmed"></polygon>` : nothing}
-                ${on
-                  ? html`
-                      <polygon points=${pts} class="zone-glow"></polygon>
-                      <polygon points=${pts} class="selected"></polygon>
-                      <circle class="zone-check-bg" cx=${cx.toFixed(2)} cy=${cy.toFixed(2)} r="4.8"></circle>
-                      <path
-                        class="zone-check-mark"
-                        d="M ${(cx - 2).toFixed(2)} ${cy.toFixed(2)} L ${(cx - 0.5).toFixed(2)} ${(cy + 1.6).toFixed(2)} L ${(cx + 2.4).toFixed(2)} ${(cy - 1.8).toFixed(2)}"
-                      ></path>
-                    `
-                  : nothing}
-                <text x=${cx.toFixed(2)} y=${(cy + (on ? 8 : 3.5)).toFixed(2)} class="zone-label ${on ? "on" : ""}">
-                  ${z.shortLabel || z.name}
-                </text>
-              `;
-            })}
-          </svg>
-        </div>
-      `;
-    }
-
     _renderGeoJsonHero(zoneFeatures, selected, phase, projection) {
-      const proj =
-        projection ||
-        lymowMapProjection(null, zoneFeatureBounds(zoneFeatures));
+      const proj = projection || lymowMapProjection(null, zoneFeatureBounds(zoneFeatures));
       if (!proj) return nothing;
       const hasSelection = selected?.size > 0;
       return html`
@@ -1420,7 +1392,7 @@
       `;
     }
 
-    _renderMapHero(entities, phase, zoneFeatures, selected, projection, schematicProjection, highlightZones) {
+    _renderMapHero(entities, phase, zoneFeatures, selected, overlayProjection, highlightZones) {
       const st = entityState(this.hass, entities.map);
       const token = st?.attributes?.access_token || "";
       const src = cameraProxyUrl(this.hass, entities.map, token);
@@ -1436,13 +1408,10 @@
                 @error=${this._onMapError}
               />
               ${highlightZones
-                ? this._renderMapZoneOverlay(zoneFeatures, selected, projection)
+                ? this._renderMapZoneOverlay(zoneFeatures, selected, overlayProjection)
                 : nothing}
             </div>
           </div>
-          ${highlightZones
-            ? this._renderZonePreviewSvg(zoneFeatures, selected, schematicProjection)
-            : nothing}
           <div class="map-badge">Live map</div>
         </div>
       `;
@@ -1458,20 +1427,16 @@
       const img = heroArtPath(cfg, activity);
       const artSrc = mediaUrl(this.hass, img);
       const selected = this._selectedZoneSet();
-      const { zones: zoneFeatures, projection, schematicProjection } = this._zoneFeatureData(cfg, entities);
-      const highlightZones =
-        cfg.show_zone_picker !== false &&
-        selected.size > 0 &&
-        zoneFeatures.length > 0 &&
-        (projection || schematicProjection);
+      const { zones: zoneFeatures, overlayProjection } = this._zoneFeatureData(cfg, entities);
+      const zonePickActive = cfg.show_zone_picker !== false && selected.size > 0;
+      const highlightZones = zonePickActive && zoneFeatures.length > 0 && overlayProjection;
       const artFailed = Boolean(artSrc && this._artFailedSrc === artSrc);
 
-      // Prefer live map (+ zone overlay) whenever the map camera exists.
       const useLiveMap =
         entities.map &&
-        (mapOn || highlightZones || mode === "map" || artFailed) &&
-        (mode !== "art" || highlightZones) &&
-        (mode === "map" || highlightZones || !this._mapFailed);
+        (mapOn || zonePickActive || mode === "map" || artFailed) &&
+        (mode !== "art" || zonePickActive) &&
+        (mode === "map" || zonePickActive || !this._mapFailed);
 
       if (useLiveMap) {
         return this._renderMapHero(
@@ -1479,8 +1444,7 @@
           phase,
           zoneFeatures,
           selected,
-          projection,
-          schematicProjection,
+          overlayProjection,
           highlightZones
         );
       }
@@ -1501,9 +1465,8 @@
         `;
       }
 
-      // GeoJSON schematic only when there is no map camera at all.
-      if (!entities.map && zoneFeatures.length && projection) {
-        return this._renderGeoJsonHero(zoneFeatures, selected, phase, projection);
+      if (!entities.map && zoneFeatures.length && overlayProjection) {
+        return this._renderGeoJsonHero(zoneFeatures, selected, phase, overlayProjection);
       }
 
       return html`<div class="hero empty-hero ${phase}"></div>`;
@@ -1859,48 +1822,6 @@
           color: #fde68a;
           background: rgba(0, 0, 0, 0.65);
           z-index: 3;
-        }
-        .zone-preview {
-          margin-top: 6px;
-          padding: 6px;
-          border-radius: 8px;
-          background: var(--secondary-background-color);
-          width: min(100%, 160px);
-        }
-        .zone-preview-label {
-          font-size: 0.68rem;
-          font-weight: 600;
-          color: var(--secondary-text-color);
-          margin-bottom: 4px;
-          text-align: center;
-        }
-        .zone-preview svg {
-          display: block;
-          width: 100%;
-          aspect-ratio: 1;
-          max-height: 160px;
-          background: radial-gradient(circle at 50% 45%, #14532d 0%, #0f172a 72%);
-          border-radius: 6px;
-        }
-        .zone-preview .idle-outline {
-          fill: rgba(34, 197, 94, 0.12);
-          stroke: rgba(134, 239, 172, 0.65);
-          stroke-width: 0.8;
-        }
-        .zone-preview .dimmed {
-          fill: rgba(0, 0, 0, 0.22);
-          stroke: rgba(255, 255, 255, 0.1);
-          stroke-width: 0.35;
-        }
-        .zone-preview .selected {
-          fill: rgba(37, 99, 235, 0.55);
-          stroke: #ffffff;
-          stroke-width: 1.6;
-        }
-        .zone-preview .zone-glow {
-          fill: rgba(59, 130, 246, 0.28);
-          stroke: rgba(147, 197, 253, 0.95);
-          stroke-width: 2.4;
         }
         .zone-overlay .zone-dim {
           fill: rgba(15, 23, 42, 0.45);
