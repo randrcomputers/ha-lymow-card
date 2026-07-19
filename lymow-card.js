@@ -700,7 +700,7 @@
     if (mode === "enu") return rawRing;
 
     // Lymow-HA emits WGS84 [lon, lat] when has_gps_origin is true (or coords look geographic).
-    if (origin && (attrs?.has_gps_origin || ringLooksLikeWgs84(rawRing))) {
+    if (origin && (gpsOriginReady(attrs) || ringLooksLikeWgs84(rawRing))) {
       return latLonRingToEnu(rawRing, origin.lat0, origin.lon0);
     }
 
@@ -769,44 +769,65 @@
     };
   }
 
-  function boundsSizeMatch(ringBounds, renderDebug) {
-    if (!ringBounds || !renderDebug) return false;
-    const rw = ringBounds.maxX - ringBounds.minX;
-    const rh = ringBounds.maxY - ringBounds.minY;
-    const dw = renderDebug.max_x - renderDebug.min_x;
-    const dh = renderDebug.max_y - renderDebug.min_y;
-    if (!rw || !rh || !dw || !dh) return false;
-    return Math.abs(rw / dw - 1) < 0.2 && Math.abs(rh / dh - 1) < 0.2;
+  function gpsOriginReady(attrs) {
+    const v = attrs?.has_gps_origin;
+    return v === true || v === "true" || v === 1;
   }
 
-  /** Shift converted rings when scale matches map bounds but origin was rounded. */
+  function featureCollectionFeatures(value) {
+    if (!value) return null;
+    let parsed = value;
+    if (typeof parsed === "string") {
+      try {
+        parsed = JSON.parse(parsed);
+      } catch {
+        return null;
+      }
+    }
+    if (Array.isArray(parsed?.features)) return parsed.features;
+    return null;
+  }
+
+  function ringsBoundsAlignToMap(zones, renderDebug) {
+    const rb = zoneFeatureBounds(zones);
+    if (!rb || !renderDebug) return false;
+    const keys = ["min_x", "max_x", "min_y", "max_y"];
+    if (!keys.every((k) => Number.isFinite(renderDebug[k]))) return false;
+    const padX = Math.max((renderDebug.max_x - renderDebug.min_x) * 0.08, 1);
+    const padY = Math.max((renderDebug.max_y - renderDebug.min_y) * 0.08, 1);
+    return (
+      rb.minX >= renderDebug.min_x - padX &&
+      rb.maxX <= renderDebug.max_x + padX &&
+      rb.minY >= renderDebug.min_y - padY &&
+      rb.maxY <= renderDebug.max_y + padY
+    );
+  }
+
+  /** Shift converted ENU rings onto the map camera bounds (handles rounded origin). */
   function alignZonesToMapBounds(zones, renderDebug) {
     if (!zones?.length || !renderDebug) return zones;
     const rb = zoneFeatureBounds(zones);
-    if (!rb || !boundsSizeMatch(rb, renderDebug)) return zones;
-    if (zones.every((z) => ringMatchesMapBounds(z.ring, renderDebug))) return zones;
+    if (!rb || rb.width < 2 || rb.height < 2) return zones;
+    if (ringsBoundsAlignToMap(zones, renderDebug)) return zones;
 
     const dx = renderDebug.min_x - rb.minX;
     const dy = renderDebug.min_y - rb.minY;
+    const dw = renderDebug.max_x - renderDebug.min_x;
+    const dh = renderDebug.max_y - renderDebug.min_y;
+    if (Math.abs(dx) > dw || Math.abs(dy) > dh) return zones;
+
     return zones.map((z) => ({
       ...z,
       ring: z.ring.map(([x, y]) => [x + dx, y + dy]),
     }));
   }
 
-  function zonesAlignToMap(zones, renderDebug) {
-    if (!zones?.length || !renderDebug) return false;
-    return zones.every((z) => ringMatchesMapBounds(z.ring, renderDebug));
-  }
-
   /** Use map camera bounds only when zone rings already sit in that ENU frame. */
-  function pickOverlayProjection(renderDebug, ringBounds, zones) {
+  function pickOverlayProjection(renderDebug, ringBounds) {
     const dbgOk =
       renderDebug &&
       ["min_x", "max_x", "min_y", "max_y"].every((k) => Number.isFinite(renderDebug[k]));
-    if (dbgOk && zonesAlignToMap(zones, renderDebug)) {
-      return lymowMapProjection(renderDebug, ringBounds);
-    }
+    if (dbgOk) return lymowMapProjection(renderDebug, ringBounds);
     return lymowMapProjection(null, ringBounds);
   }
 
@@ -854,12 +875,10 @@
     const renderDebug = mapSt?.attributes?.render_debug || null;
 
     const attrs = st.attributes;
-    let features = [];
-    if (attrs.geojson_zones?.features) {
-      features = attrs.geojson_zones.features;
-    } else if (attrs.geojson?.features) {
-      features = attrs.geojson.features;
-    }
+    let features =
+      featureCollectionFeatures(attrs.geojson_zones) ||
+      featureCollectionFeatures(attrs.geojson) ||
+      [];
 
     const zones = [];
     const seen = new Set();
@@ -900,7 +919,7 @@
 
     const alignedZones = alignZonesToMapBounds(zones, renderDebug);
     const ringBounds = zoneFeatureBounds(alignedZones);
-    const overlayProjection = pickOverlayProjection(renderDebug, ringBounds, alignedZones);
+    const overlayProjection = pickOverlayProjection(renderDebug, ringBounds);
     return { zones: alignedZones, overlayProjection };
   }
 
