@@ -670,36 +670,73 @@
     return width < 1 && height < 1;
   }
 
-  function ringToEnu(ring, feature, attrs) {
+  function enuBasePoint(attrs) {
     const ebp = attrs?.enu_base_point || {};
-    const lat0 = Number(ebp.latitude);
-    const lon0 = Number(ebp.longitude);
-    const hasOrigin = Number.isFinite(lat0) && Number.isFinite(lon0);
+    const lat0 = Number(ebp.latitude ?? ebp.lat);
+    const lon0 = Number(ebp.longitude ?? ebp.lon ?? ebp.lng);
+    if (!Number.isFinite(lat0) || !Number.isFinite(lon0)) return null;
+    return { lat0, lon0 };
+  }
+
+  function ringMatchesMapBounds(ring, renderDebug) {
+    if (!renderDebug || !ring?.length) return false;
+    const keys = ["min_x", "max_x", "min_y", "max_y"];
+    if (!keys.every((k) => Number.isFinite(renderDebug[k]))) return false;
+    const { minX, maxX, minY, maxY } = ringSpan(ring);
+    const padX = Math.max((renderDebug.max_x - renderDebug.min_x) * 0.35, 1);
+    const padY = Math.max((renderDebug.max_y - renderDebug.min_y) * 0.35, 1);
+    return (
+      minX >= renderDebug.min_x - padX &&
+      maxX <= renderDebug.max_x + padX &&
+      minY >= renderDebug.min_y - padY &&
+      maxY <= renderDebug.max_y + padY
+    );
+  }
+
+  function ringToEnu(rawRing, feature, attrs) {
+    const origin = enuBasePoint(attrs);
     const mode = ringCoordMode(feature);
-    if (mode === "enu" || ringLooksLikeEnu(ring)) return ring;
-    if (hasOrigin && (attrs?.has_gps_origin || ringLooksLikeWgs84(ring))) {
-      let enu = latLonRingToEnu(ring, lat0, lon0);
+
+    if (mode === "enu") return rawRing;
+
+    // Lymow-HA emits WGS84 [lon, lat] when has_gps_origin is true.
+    if (attrs?.has_gps_origin && origin) {
+      return latLonRingToEnu(rawRing, origin.lat0, origin.lon0);
+    }
+
+    if (ringLooksLikeEnu(rawRing)) return rawRing;
+
+    if (origin && ringLooksLikeWgs84(rawRing)) {
+      let enu = latLonRingToEnu(rawRing, origin.lat0, origin.lon0);
       if (ringSpan(enu).width < 0.01) {
-        const swapped = ring.map(([a, b]) => [b, a]);
-        enu = latLonRingToEnu(swapped, lat0, lon0);
+        enu = latLonRingToEnu(
+          rawRing.map(([a, b]) => [b, a]),
+          origin.lat0,
+          origin.lon0
+        );
       }
       return enu;
     }
-    return ring;
+
+    return rawRing;
   }
 
-  function projectionBoundsMatch(renderDebug, ringBounds) {
-    if (!renderDebug || !ringBounds) return false;
-    const keys = ["min_x", "max_x", "min_y", "max_y"];
-    if (!keys.every((k) => Number.isFinite(renderDebug[k]))) return false;
-    const rw = ringBounds.maxX - ringBounds.minX;
-    const rh = ringBounds.maxY - ringBounds.minY;
-    const dw = renderDebug.max_x - renderDebug.min_x;
-    const dh = renderDebug.max_y - renderDebug.min_y;
-    if (!rw || !rh || !dw || !dh) return false;
-    const ratioW = rw / dw;
-    const ratioH = rh / dh;
-    return ratioW > 0.2 && ratioW < 5 && ratioH > 0.2 && ratioH < 5;
+  function resolveZoneRing(rawRing, feature, attrs, renderDebug) {
+    let ring = ringToEnu(rawRing, feature, attrs);
+    if (!renderDebug || ringMatchesMapBounds(ring, renderDebug)) return ring;
+
+    const origin = enuBasePoint(attrs);
+    if (!origin) return ring;
+
+    const candidates = [
+      latLonRingToEnu(rawRing, origin.lat0, origin.lon0),
+      latLonRingToEnu(rawRing.map(([a, b]) => [b, a]), origin.lat0, origin.lon0),
+      rawRing,
+    ];
+    for (const candidate of candidates) {
+      if (ringMatchesMapBounds(candidate, renderDebug)) return candidate;
+    }
+    return ring;
   }
 
   /** Match Lymow-HA build_map_png: uniform scale, PAD, Y-flip. */
@@ -732,13 +769,11 @@
     };
   }
 
-  /** Prefer map camera bounds when they match zone rings; else fit rings only. */
+  /** Map camera render_debug matches Lymow-HA build_map_png bounds. */
   function pickOverlayProjection(renderDebug, ringBounds) {
-    const ringProj = lymowMapProjection(null, ringBounds);
-    if (!renderDebug || !projectionBoundsMatch(renderDebug, ringBounds)) {
-      return ringProj;
-    }
-    return lymowMapProjection(renderDebug, ringBounds) || ringProj;
+    const mapProj = lymowMapProjection(renderDebug, ringBounds);
+    if (mapProj?.usesMapBounds) return mapProj;
+    return lymowMapProjection(null, ringBounds);
   }
 
   function zoneIsSelected(zone, selected) {
@@ -807,7 +842,7 @@
         .filter((pt) => Number.isFinite(pt[0]) && Number.isFinite(pt[1]));
       if (ring.length < 3) continue;
 
-      ring = ringToEnu(ring, f, attrs);
+      ring = resolveZoneRing(ring, f, attrs, renderDebug);
 
       seen.add(id);
       const index = zones.length;
@@ -1342,6 +1377,7 @@
             const on = zoneIsSelected(z, selected);
             const [cx, cy] = projection.toPoint(...ringCentroid(z.ring));
             return html`
+              <polygon points=${pts} class="zone-outline"></polygon>
               ${!on ? html`<polygon points=${pts} class="zone-dim"></polygon>` : nothing}
               ${on
                 ? html`
@@ -1409,6 +1445,8 @@
       const st = entityState(this.hass, entities.map);
       const token = st?.attributes?.access_token || "";
       const src = cameraProxyUrl(this.hass, entities.map, token);
+      const projection =
+        overlayProjection || lymowMapProjection(null, zoneFeatureBounds(zoneFeatures));
       void this._mapTick;
       return html`
         <div class="hero map-hero ${phase}">
@@ -1420,8 +1458,8 @@
                 draggable="false"
                 @error=${this._onMapError}
               />
-              ${highlightZones
-                ? this._renderMapZoneOverlay(zoneFeatures, selected, overlayProjection)
+              ${highlightZones && projection
+                ? this._renderMapZoneOverlay(zoneFeatures, selected, projection)
                 : nothing}
             </div>
           </div>
@@ -1442,7 +1480,7 @@
       const selected = this._selectedZoneSet();
       const { zones: zoneFeatures, overlayProjection } = this._zoneFeatureData(cfg, entities);
       const zonePickActive = cfg.show_zone_picker !== false && selected.size > 0;
-      const highlightZones = zonePickActive && zoneFeatures.length > 0 && overlayProjection;
+      const highlightZones = zonePickActive && zoneFeatures.length > 0;
       const artFailed = Boolean(artSrc && this._artFailedSrc === artSrc);
 
       const useLiveMap =
@@ -1812,7 +1850,7 @@
           display: block;
           width: 100%;
           height: 100%;
-          object-fit: contain;
+          object-fit: fill;
           border-radius: 8px;
         }
         .zone-overlay {
@@ -1824,42 +1862,34 @@
           overflow: visible;
           z-index: 2;
         }
-        .zone-overlay-warn {
-          position: absolute;
-          left: 4px;
-          right: 4px;
-          bottom: 4px;
-          padding: 3px 6px;
-          border-radius: 6px;
-          font-size: 0.62rem;
-          text-align: center;
-          color: #fde68a;
-          background: rgba(0, 0, 0, 0.65);
-          z-index: 3;
+        .zone-overlay .zone-outline {
+          fill: none;
+          stroke: rgba(255, 255, 255, 0.55);
+          stroke-width: 0.45;
         }
         .zone-overlay .zone-dim {
-          fill: rgba(15, 23, 42, 0.45);
-          stroke: rgba(255, 255, 255, 0.35);
-          stroke-width: 0.55;
+          fill: rgba(0, 0, 0, 0.48);
+          stroke: rgba(255, 255, 255, 0.2);
+          stroke-width: 0.45;
         }
         .zone-overlay .zone-glow {
-          fill: rgba(59, 130, 246, 0.28);
-          stroke: rgba(147, 197, 253, 0.95);
-          stroke-width: 2.4;
+          fill: rgba(22, 101, 52, 0.38);
+          stroke: rgba(74, 222, 128, 0.95);
+          stroke-width: 2.2;
         }
         .zone-overlay .zone-selected {
-          fill: rgba(37, 99, 235, 0.55);
-          stroke: #ffffff;
-          stroke-width: 1.6;
+          fill: rgba(21, 128, 61, 0.78);
+          stroke: #14532d;
+          stroke-width: 1.8;
         }
         .zone-overlay .zone-check-bg {
-          fill: #1d4ed8;
-          stroke: #ffffff;
+          fill: #14532d;
+          stroke: #bbf7d0;
           stroke-width: 0.7;
         }
         .zone-overlay .zone-check-mark {
           fill: none;
-          stroke: #ffffff;
+          stroke: #ecfdf5;
           stroke-width: 1.3;
           stroke-linecap: round;
           stroke-linejoin: round;
@@ -1874,9 +1904,9 @@
           stroke-width: 0.55;
         }
         .zone-overlay .zone-label.on {
-          fill: #ffffff;
+          fill: #ecfdf5;
           font-size: 5px;
-          stroke: rgba(29, 78, 216, 0.95);
+          stroke: rgba(20, 83, 45, 0.95);
           stroke-width: 0.7;
         }
         .geo-hero .dimmed {
@@ -1893,18 +1923,18 @@
           display: block;
         }
         .geo-hero .selected {
-          fill: rgba(37, 99, 235, 0.55);
-          stroke: #ffffff;
+          fill: rgba(21, 128, 61, 0.78);
+          stroke: #14532d;
           stroke-width: 1.6;
         }
         .geo-hero .zone-glow {
-          fill: rgba(59, 130, 246, 0.28);
-          stroke: rgba(147, 197, 253, 0.95);
+          fill: rgba(22, 101, 52, 0.38);
+          stroke: rgba(74, 222, 128, 0.95);
           stroke-width: 2.4;
         }
         .geo-hero .zone-check-bg {
-          fill: #1d4ed8;
-          stroke: #ffffff;
+          fill: #14532d;
+          stroke: #bbf7d0;
           stroke-width: 0.7;
         }
         .geo-hero .zone-check-mark {
