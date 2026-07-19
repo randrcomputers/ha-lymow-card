@@ -42,6 +42,27 @@
     headlights: "_headlights",
     btn_cancel: "_btn_cancel_task",
     btn_dock_cancel: "_btn_dock_cancel",
+    wifi: "_wifi_signal",
+    lte: "_lte_signal",
+    network: "_network_type",
+  };
+
+  /** unique_id suffixes and common HA entity_id slug variants (name-based slugs). */
+  const ENTITY_SUFFIX_ALIASES = {
+    rtk: ["_rtk_status", "_rtk_gps"],
+    status: ["_work_status"],
+    area: ["_session_area", "_session_mowed_area"],
+    mow_mode: ["_clean_mode_select", "_mow_mode"],
+  };
+
+  const ENTITY_NAME_HINTS = {
+    rtk: [/^rtk/i, /rtk gps/i],
+    blade: [/blade height/i, /cut height/i],
+    wifi: [/wifi signal/i],
+    lte: [/4g signal/i, /lte signal/i],
+    network: [/network type/i],
+    area: [/session mowed area/i, /session area/i],
+    map_area: [/map total area/i],
   };
 
   const ENTITY_DOMAINS = {
@@ -65,6 +86,9 @@
     headlights: "switch",
     btn_cancel: "button",
     btn_dock_cancel: "button",
+    wifi: "sensor",
+    lte: "sensor",
+    network: "sensor",
   };
 
   const ACTIVITY_LABELS = {
@@ -275,14 +299,51 @@
     return null;
   }
 
+  function entitySlugPart(entityId) {
+    if (!entityId || !String(entityId).includes(".")) return "";
+    return String(entityId).split(".").slice(1).join(".");
+  }
+
+  function suffixAliases(key, suffix) {
+    return ENTITY_SUFFIX_ALIASES[key] || [suffix];
+  }
+
+  function matchesEntitySlug(entityId, key, suffix) {
+    const slug = entitySlugPart(entityId);
+    if (!slug) return false;
+    return suffixAliases(key, suffix).some((s) => slug.endsWith(s));
+  }
+
+  function fillByNameHints(hass, devId, found) {
+    if (!devId) return;
+    for (const [eid, ent] of Object.entries(hass.entities || {})) {
+      if (ent.device_id !== devId) continue;
+      const domain = entityDomain(eid);
+      const st = entityState(hass, eid);
+      const name = String(st?.attributes?.friendly_name || ent.original_name || "").toLowerCase();
+      for (const [key, patterns] of Object.entries(ENTITY_NAME_HINTS)) {
+        if (found[key]) continue;
+        const expectedDomain = ENTITY_DOMAINS[key];
+        if (expectedDomain && domain !== expectedDomain) continue;
+        if (!patterns.some((p) => p.test(name))) continue;
+        if (canDiscoverEntity(hass, eid, key, domain)) found[key] = eid;
+      }
+    }
+  }
+
   function applyMowerSlugFallbacks(hass, merged, mowerEntityId) {
     if (!mowerEntityId) return merged;
     for (const [key, suffix] of Object.entries(ENTITY_SUFFIXES)) {
       if (merged[key] || key === "mower") continue;
       const domain = ENTITY_DOMAINS[key];
       if (!domain) continue;
-      const guessed = entityFromMowerSuffix(mowerEntityId, suffix, domain);
-      if (entityExists(hass, guessed)) merged[key] = guessed;
+      for (const alias of suffixAliases(key, suffix)) {
+        const guessed = entityFromMowerSuffix(mowerEntityId, alias, domain);
+        if (entityExists(hass, guessed)) {
+          merged[key] = guessed;
+          break;
+        }
+      }
     }
     return merged;
   }
@@ -333,7 +394,9 @@
         }
 
         for (const [key, suffix] of Object.entries(ENTITY_SUFFIXES)) {
-          if (!matchesEntitySuffix(uid, key, suffix)) continue;
+          const uidMatch = matchesEntitySuffix(uid, key, suffix);
+          const slugMatch = matchesEntitySlug(eid, key, suffix);
+          if (!uidMatch && !slugMatch) continue;
           if (key === "error" && domain !== "binary_sensor") continue;
           if (key === "mower") continue;
           if (canDiscoverEntity(hass, eid, key, domain)) {
@@ -341,6 +404,7 @@
           }
         }
       }
+      fillByNameHints(hass, devId, found);
     }
 
     const merged = { ...found };
@@ -995,6 +1059,18 @@
       if (entities.rtk) {
         items.push({ label: "RTK", value: textState(hass, entities.rtk, "—") });
       }
+      const network = textState(hass, entities.network, "").toLowerCase();
+      const useLte = /lte|4g|cell|mobile/i.test(network);
+      const signalEntity = useLte ? entities.lte || entities.wifi : entities.wifi || entities.lte;
+      const signalLabel = useLte && entities.lte ? "4G" : entities.wifi ? "WiFi" : entities.lte ? "4G" : "Signal";
+      if (signalEntity) {
+        const sig = textState(hass, signalEntity, "—");
+        const unit = entityState(hass, signalEntity)?.attributes?.unit_of_measurement;
+        items.push({
+          label: signalLabel,
+          value: sig === "—" || !unit ? sig : `${sig} ${unit}`.trim(),
+        });
+      }
       if (!items.length) return nothing;
       return html`
         <div class="stats">
@@ -1024,14 +1100,7 @@
           title=${on ? "Headlights on" : "Headlights off"}
           @click=${() => this._toggleHeadlights(entities)}
         >
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <rect x="3" y="7" width="8" height="10" rx="2" fill="currentColor" />
-            <path
-              fill="currentColor"
-              d="M13 9.5h8v1.75H13V9.5zm0 3.375h6.5v1.75H13v-1.75zm0 3.375h5v1.75H13V16.25z"
-              opacity=${on ? "1" : "0.45"}
-            />
-          </svg>
+          <ha-icon icon="mdi:car-light-high"></ha-icon>
         </button>
       `;
     }
@@ -1450,13 +1519,16 @@
           background: rgba(253, 224, 71, 0.14);
           box-shadow: 0 0 10px rgba(253, 224, 71, 0.35);
         }
+        .headlights-btn.on ha-icon {
+          color: #fde047;
+        }
         .headlights-btn:disabled {
           opacity: 0.45;
           cursor: not-allowed;
         }
-        .headlights-btn svg {
-          width: 16px;
-          height: 16px;
+        .headlights-btn ha-icon {
+          --mdc-icon-size: 20px;
+          display: flex;
         }
         .battery {
           display: flex;
@@ -1728,7 +1800,7 @@
         }
         .stats {
           display: grid;
-          grid-template-columns: repeat(3, minmax(0, 1fr));
+          grid-template-columns: repeat(auto-fit, minmax(72px, 1fr));
           gap: 8px;
         }
         .stat {
