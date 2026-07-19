@@ -750,6 +750,35 @@
     return zones.some((z) => ringProjectsToView(projection, z.ring));
   }
 
+  /** Schematic fit for WGS84 [lon, lat] rings — always fills the 0–100 viewBox. */
+  function wgs84SchematicProjection(rings) {
+    const bounds = computeWgs84Bounds(rings);
+    if (!bounds) return null;
+    const W = 100;
+    const PAD = 6;
+    const lonSpan = bounds.maxLon - bounds.minLon || 1e-9;
+    const latSpan = bounds.maxLat - bounds.minLat || 1e-9;
+    const scale = (W - PAD * 2) / Math.max(lonSpan, latSpan);
+    return {
+      toPoint(lon, lat) {
+        return [(lon - bounds.minLon) * scale + PAD, W - ((lat - bounds.minLat) * scale + PAD)];
+      },
+      toPoints(ring) {
+        return ring
+          .map(([lon, lat]) => {
+            const [nx, ny] = this.toPoint(lon, lat);
+            return `${nx.toFixed(2)},${ny.toFixed(2)}`;
+          })
+          .join(" ");
+      },
+    };
+  }
+
+  function schematicProjectionForZones(zoneFeatures) {
+    const rawRings = zoneFeatures.map((z) => z.rawRing || z.ring);
+    return wgs84SchematicProjection(rawRings) || lymowMapProjection(null, zoneFeatureBounds(zoneFeatures));
+  }
+
   function ringMatchesMapBounds(ring, renderDebug) {
     if (!renderDebug || !ring?.length) return false;
     const keys = ["min_x", "max_x", "min_y", "max_y"];
@@ -985,6 +1014,7 @@
         shortLabel: zoneNum ? zoneNum[1] : name.slice(0, 8),
         index,
         ring,
+        rawRing: item.rawRing,
       });
     }
 
@@ -1014,6 +1044,7 @@
           shortLabel: zoneNum ? zoneNum[1] : name.slice(0, 8),
           index,
           ring: mapWgs84RingToRenderEnu(item.rawRing, wgsBounds, renderDebug),
+          rawRing: item.rawRing,
         };
       });
       alignedZones.sort((a, b) => {
@@ -1529,51 +1560,59 @@
 
     _renderZoneShapePanel(zoneFeatures, selected) {
       if (!zoneFeatures?.length || !selected?.size) return nothing;
-      const proj = lymowMapProjection(null, zoneFeatureBounds(zoneFeatures));
+      const proj = schematicProjectionForZones(zoneFeatures);
       if (!proj) return nothing;
 
       const shapes = [];
       for (const z of zoneFeatures) {
-        const pts = proj.toPoints(z.ring);
+        const ring = z.rawRing || z.ring;
+        const pts = proj.toPoints(ring);
         if (!pts || pts.includes("NaN")) continue;
         const on = zoneIsSelected(z, selected);
-        const [cx, cy] = proj.toPoint(...ringCentroid(z.ring));
+        const [cx, cy] = proj.toPoint(...ringCentroid(ring));
         if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
         shapes.push({ z, pts, on, cx, cy });
       }
       if (!shapes.length) return nothing;
 
       const count = selected.size;
+      const idle = shapes.filter((s) => !s.on);
+      const active = shapes.filter((s) => s.on);
+
       return html`
         <div class="zone-shape-panel" aria-label="Zone shapes">
           <div class="zone-shape-label">${count === 1 ? "1 zone" : `${count} zones`}</div>
           <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
-            ${shapes.map(({ z, pts, on, cx, cy }) => html`
+            ${idle.map(
+              ({ pts }) => html`
+                <polygon
+                  .points=${pts}
+                  fill="none"
+                  stroke="rgba(148, 163, 184, 0.55)"
+                  stroke-width="1"
+                  stroke-linejoin="round"
+                ></polygon>
+              `
+            )}
+            ${active.map(({ z, pts, cx, cy }) => html`
               <polygon
                 .points=${pts}
-                fill=${on ? "rgba(21, 128, 61, 0.28)" : "none"}
-                stroke=${on ? "#15803d" : "rgba(148, 163, 184, 0.45)"}
-                stroke-width=${on ? "2.2" : "0.9"}
+                fill="none"
+                stroke="#22c55e"
+                stroke-width="2.8"
                 stroke-linejoin="round"
               ></polygon>
-              ${on
-                ? html`
-                    <text
-                      x=${cx.toFixed(2)}
-                      y=${cy.toFixed(2)}
-                      fill="#ecfdf5"
-                      font-size="5.5"
-                      font-weight="700"
-                      text-anchor="middle"
-                      dominant-baseline="middle"
-                      stroke="rgba(0,0,0,0.75)"
-                      stroke-width="0.5"
-                      paint-order="stroke fill"
-                    >
-                      ${z.shortLabel || z.name}
-                    </text>
-                  `
-                : nothing}
+              <text
+                x=${cx.toFixed(2)}
+                y=${cy.toFixed(2)}
+                fill="#ecfdf5"
+                font-size="6"
+                font-weight="700"
+                text-anchor="middle"
+                dominant-baseline="middle"
+              >
+                ${z.shortLabel || z.name}
+              </text>
             `)}
           </svg>
         </div>
@@ -2058,8 +2097,8 @@
           width: min(48%, 150px);
           aspect-ratio: 1;
           border-radius: 8px;
-          background: radial-gradient(circle at 50% 45%, #14532d 0%, #0f172a 72%);
-          box-shadow: inset 0 0 0 1px rgba(34, 197, 94, 0.2);
+          background: #0f172a;
+          box-shadow: inset 0 0 0 1px rgba(34, 197, 94, 0.35);
         }
         .zone-shape-panel svg {
           display: block;
