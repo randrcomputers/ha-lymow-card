@@ -645,37 +645,72 @@
 
   const WGS84_A = 6378137;
 
-  function ringLooksLikeEnu(ring) {
-    if (!ring?.length) return false;
+  function ringSpan(ring) {
     let minX = Infinity;
     let maxX = -Infinity;
-    for (const [x] of ring) {
+    let minY = Infinity;
+    let maxY = -Infinity;
+    for (const [x, y] of ring) {
       minX = Math.min(minX, x);
       maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y);
+      maxY = Math.max(maxY, y);
     }
-    return maxX - minX > 2;
+    return { minX, maxX, minY, maxY, width: maxX - minX, height: maxY - minY };
+  }
+
+  function ringLooksLikeEnu(ring) {
+    const { width } = ringSpan(ring);
+    return width > 2;
+  }
+
+  function ringLooksLikeWgs84(ring) {
+    const { width, height, minX, maxX, minY, maxY } = ringSpan(ring);
+    if (maxX > 180 || minX < -180 || maxY > 90 || minY < -90) return false;
+    return width < 1 && height < 1;
   }
 
   function ringToEnu(ring, feature, attrs) {
     const ebp = attrs?.enu_base_point || {};
     const lat0 = Number(ebp.latitude);
     const lon0 = Number(ebp.longitude);
-    const hasOrigin =
-      attrs?.has_gps_origin && Number.isFinite(lat0) && Number.isFinite(lon0);
+    const hasOrigin = Number.isFinite(lat0) && Number.isFinite(lon0);
     const mode = ringCoordMode(feature);
     if (mode === "enu" || ringLooksLikeEnu(ring)) return ring;
-    if (hasOrigin) return latLonRingToEnu(ring, lat0, lon0);
+    if (hasOrigin && (attrs?.has_gps_origin || ringLooksLikeWgs84(ring))) {
+      let enu = latLonRingToEnu(ring, lat0, lon0);
+      if (ringSpan(enu).width < 0.01) {
+        const swapped = ring.map(([a, b]) => [b, a]);
+        enu = latLonRingToEnu(swapped, lat0, lon0);
+      }
+      return enu;
+    }
     return ring;
   }
 
+  function projectionBoundsMatch(renderDebug, ringBounds) {
+    if (!renderDebug || !ringBounds) return false;
+    const keys = ["min_x", "max_x", "min_y", "max_y"];
+    if (!keys.every((k) => Number.isFinite(renderDebug[k]))) return false;
+    const rw = ringBounds.maxX - ringBounds.minX;
+    const rh = ringBounds.maxY - ringBounds.minY;
+    const dw = renderDebug.max_x - renderDebug.min_x;
+    const dh = renderDebug.max_y - renderDebug.min_y;
+    if (!rw || !rh || !dw || !dh) return false;
+    const ratioW = rw / dw;
+    const ratioH = rh / dh;
+    return ratioW > 0.2 && ratioW < 5 && ratioH > 0.2 && ratioH < 5;
+  }
+
   /** Match Lymow-HA build_map_png: uniform scale, PAD, Y-flip. */
-  function lymowMapProjection(renderDebug, ringBounds) {
+  function lymowMapProjection(renderDebug, ringBounds, preferDebug = true) {
     const W = 100;
     const H = 100;
     const PAD = 5;
-    const dbgValid = ["min_x", "max_x", "min_y", "max_y"].every((k) =>
-      Number.isFinite(renderDebug?.[k])
-    );
+    const dbgValid =
+      preferDebug &&
+      projectionBoundsMatch(renderDebug, ringBounds) &&
+      ["min_x", "max_x", "min_y", "max_y"].every((k) => Number.isFinite(renderDebug?.[k]));
     const min_x = dbgValid ? renderDebug.min_x : ringBounds?.minX;
     const max_x = dbgValid ? renderDebug.max_x : ringBounds?.maxX;
     const min_y = dbgValid ? renderDebug.min_y : ringBounds?.minY;
@@ -695,6 +730,15 @@
           .join(" ");
       },
     };
+  }
+
+  function zoneIsSelected(zone, selected) {
+    if (!selected?.size) return false;
+    if (selected.has(zone.id)) return true;
+    for (const sid of selected) {
+      if (String(sid) === String(zone.id)) return true;
+    }
+    return false;
   }
 
   function latLonRingToEnu(ring, lat0, lon0) {
@@ -726,7 +770,7 @@
   /** Zone polygons aligned to Lymow map camera (ENU + render_debug). */
   function loadZoneFeatures(hass, entityId, mapEntityId) {
     const st = entityState(hass, entityId);
-    if (!st?.attributes) return { zones: [], projection: null };
+    if (!st?.attributes) return { zones: [], projection: null, schematicProjection: null };
 
     const mapSt = mapEntityId ? entityState(hass, mapEntityId) : null;
     const renderDebug = mapSt?.attributes?.render_debug || null;
@@ -776,8 +820,10 @@
       return a.index - b.index;
     });
 
-    const projection = lymowMapProjection(renderDebug, zoneFeatureBounds(zones));
-    return { zones, projection };
+    const ringBounds = zoneFeatureBounds(zones);
+    const schematicProjection = lymowMapProjection(null, ringBounds, false);
+    const projection = lymowMapProjection(renderDebug, ringBounds, true) || schematicProjection;
+    return { zones, projection, schematicProjection };
   }
 
   function zoneFeatureBounds(zoneFeatures) {
@@ -1265,12 +1311,12 @@
 
     _renderMapZoneOverlay(zoneFeatures, selected, projection) {
       if (!zoneFeatures?.length || !projection || !selected?.size) return nothing;
-      const picked = zoneFeatures.filter((z) => selected.has(z.id));
       return html`
         <svg class="zone-overlay" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
           ${zoneFeatures.map((z) => {
             const pts = projection.toPoints(z.ring);
-            const on = selected.has(z.id);
+            if (!pts || pts.includes("NaN")) return nothing;
+            const on = zoneIsSelected(z, selected);
             const [cx, cy] = projection.toPoint(...ringCentroid(z.ring));
             return html`
               ${!on ? html`<polygon points=${pts} class="zone-dim"></polygon>` : nothing}
@@ -1291,23 +1337,23 @@
             `;
           })}
         </svg>
-        ${picked.length === 0
-          ? html`<div class="zone-overlay-warn">Zone shapes not matched — see preview below</div>`
-          : nothing}
       `;
     }
 
-    _renderZonePreviewSvg(zoneFeatures, selected, projection) {
-      if (!selected?.size || !zoneFeatures?.length || !projection) return nothing;
+    _renderZonePreviewSvg(zoneFeatures, selected, schematicProjection) {
+      const proj = schematicProjection || null;
+      if (!selected?.size || !zoneFeatures?.length || !proj) return nothing;
       return html`
         <div class="zone-preview">
           <div class="zone-preview-label">Selected zones preview</div>
           <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
             ${zoneFeatures.map((z) => {
-              const on = selected.has(z.id);
-              const pts = projection.toPoints(z.ring);
-              const [cx, cy] = projection.toPoint(...ringCentroid(z.ring));
+              const pts = proj.toPoints(z.ring);
+              if (!pts || pts.includes("NaN")) return nothing;
+              const on = zoneIsSelected(z, selected);
+              const [cx, cy] = proj.toPoint(...ringCentroid(z.ring));
               return html`
+                <polygon points=${pts} class="idle-outline"></polygon>
                 ${!on ? html`<polygon points=${pts} class="dimmed"></polygon>` : nothing}
                 ${on
                   ? html`
@@ -1340,7 +1386,7 @@
         <div class="hero geo-hero ${phase}">
           <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
             ${zoneFeatures.map((z) => {
-              const on = !hasSelection || selected.has(z.id);
+              const on = !hasSelection || zoneIsSelected(z, selected);
               const pts = proj.toPoints(z.ring);
               const [cx, cy] = proj.toPoint(...ringCentroid(z.ring));
               return html`
@@ -1374,7 +1420,7 @@
       `;
     }
 
-    _renderMapHero(entities, phase, zoneFeatures, selected, projection, highlightZones) {
+    _renderMapHero(entities, phase, zoneFeatures, selected, projection, schematicProjection, highlightZones) {
       const st = entityState(this.hass, entities.map);
       const token = st?.attributes?.access_token || "";
       const src = cameraProxyUrl(this.hass, entities.map, token);
@@ -1394,7 +1440,9 @@
                 : nothing}
             </div>
           </div>
-          ${highlightZones ? this._renderZonePreviewSvg(zoneFeatures, selected, projection) : nothing}
+          ${highlightZones
+            ? this._renderZonePreviewSvg(zoneFeatures, selected, schematicProjection)
+            : nothing}
           <div class="map-badge">Live map</div>
         </div>
       `;
@@ -1410,12 +1458,12 @@
       const img = heroArtPath(cfg, activity);
       const artSrc = mediaUrl(this.hass, img);
       const selected = this._selectedZoneSet();
-      const { zones: zoneFeatures, projection } = this._zoneFeatureData(cfg, entities);
+      const { zones: zoneFeatures, projection, schematicProjection } = this._zoneFeatureData(cfg, entities);
       const highlightZones =
         cfg.show_zone_picker !== false &&
         selected.size > 0 &&
         zoneFeatures.length > 0 &&
-        projection;
+        (projection || schematicProjection);
       const artFailed = Boolean(artSrc && this._artFailedSrc === artSrc);
 
       // Prefer live map (+ zone overlay) whenever the map camera exists.
@@ -1432,6 +1480,7 @@
           zoneFeatures,
           selected,
           projection,
+          schematicProjection,
           highlightZones
         );
       }
@@ -1766,6 +1815,11 @@
           display: block;
           border-radius: 8px;
         }
+        .map-hero {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+        }
         .map-stack {
           display: flex;
           justify-content: center;
@@ -1811,6 +1865,7 @@
           padding: 6px;
           border-radius: 8px;
           background: var(--secondary-background-color);
+          width: min(100%, 160px);
         }
         .zone-preview-label {
           font-size: 0.68rem;
@@ -1822,9 +1877,15 @@
         .zone-preview svg {
           display: block;
           width: 100%;
-          max-height: 110px;
+          aspect-ratio: 1;
+          max-height: 160px;
           background: radial-gradient(circle at 50% 45%, #14532d 0%, #0f172a 72%);
           border-radius: 6px;
+        }
+        .zone-preview .idle-outline {
+          fill: rgba(34, 197, 94, 0.12);
+          stroke: rgba(134, 239, 172, 0.65);
+          stroke-width: 0.8;
         }
         .zone-preview .dimmed {
           fill: rgba(0, 0, 0, 0.22);
