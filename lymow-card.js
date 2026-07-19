@@ -1527,62 +1527,56 @@
       `;
     }
 
-    _renderMapZoneOverlay(zoneFeatures, selected, projection) {
-      if (!zoneFeatures?.length || !projection || !selected?.size) return nothing;
+    _renderZoneShapePanel(zoneFeatures, selected) {
+      if (!zoneFeatures?.length || !selected?.size) return nothing;
+      const proj = lymowMapProjection(null, zoneFeatureBounds(zoneFeatures));
+      if (!proj) return nothing;
+
       const shapes = [];
       for (const z of zoneFeatures) {
-        const pts = projection.toPoints(z.ring);
+        const pts = proj.toPoints(z.ring);
         if (!pts || pts.includes("NaN")) continue;
         const on = zoneIsSelected(z, selected);
-        const [cx, cy] = projection.toPoint(...ringCentroid(z.ring));
+        const [cx, cy] = proj.toPoint(...ringCentroid(z.ring));
         if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
         shapes.push({ z, pts, on, cx, cy });
       }
       if (!shapes.length) return nothing;
 
+      const count = selected.size;
       return html`
-        <svg
-          class="zone-overlay"
-          viewBox="0 0 100 100"
-          preserveAspectRatio="xMidYMid meet"
-          aria-hidden="true"
-        >
-          ${shapes.map(({ z, pts, on, cx, cy }) => html`
-            <polygon
-              .points=${pts}
-              fill=${on ? "rgba(21, 128, 61, 0.85)" : "rgba(0, 0, 0, 0.55)"}
-              stroke=${on ? "#14532d" : "rgba(255, 255, 255, 0.4)"}
-              stroke-width=${on ? "2" : "0.8"}
-              stroke-linejoin="round"
-            ></polygon>
-            ${on
-              ? html`
-                  <circle cx=${cx.toFixed(2)} cy=${cy.toFixed(2)} r="4.5" fill="#14532d" stroke="#ecfdf5" stroke-width="0.8"></circle>
-                  <path
-                    fill="none"
-                    stroke="#ecfdf5"
-                    stroke-width="1.4"
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    d="M ${(cx - 2).toFixed(2)} ${cy.toFixed(2)} L ${(cx - 0.5).toFixed(2)} ${(cy + 1.6).toFixed(2)} L ${(cx + 2.4).toFixed(2)} ${(cy - 1.8).toFixed(2)}"
-                  ></path>
-                `
-              : nothing}
-            <text
-              x=${cx.toFixed(2)}
-              y=${(cy + (on ? 8 : 3.5)).toFixed(2)}
-              fill=${on ? "#ecfdf5" : "rgba(255,255,255,0.85)"}
-              font-size=${on ? "5" : "4.5"}
-              font-weight="700"
-              text-anchor="middle"
-              stroke="rgba(0,0,0,0.8)"
-              stroke-width="0.55"
-              paint-order="stroke fill"
-            >
-              ${z.shortLabel || z.name}
-            </text>
-          `)}
-        </svg>
+        <div class="zone-shape-panel" aria-label="Zone shapes">
+          <div class="zone-shape-label">${count === 1 ? "1 zone" : `${count} zones`}</div>
+          <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
+            ${shapes.map(({ z, pts, on, cx, cy }) => html`
+              <polygon
+                .points=${pts}
+                fill=${on ? "rgba(21, 128, 61, 0.28)" : "none"}
+                stroke=${on ? "#15803d" : "rgba(148, 163, 184, 0.45)"}
+                stroke-width=${on ? "2.2" : "0.9"}
+                stroke-linejoin="round"
+              ></polygon>
+              ${on
+                ? html`
+                    <text
+                      x=${cx.toFixed(2)}
+                      y=${cy.toFixed(2)}
+                      fill="#ecfdf5"
+                      font-size="5.5"
+                      font-weight="700"
+                      text-anchor="middle"
+                      dominant-baseline="middle"
+                      stroke="rgba(0,0,0,0.75)"
+                      stroke-width="0.5"
+                      paint-order="stroke fill"
+                    >
+                      ${z.shortLabel || z.name}
+                    </text>
+                  `
+                : nothing}
+            `)}
+          </svg>
+        </div>
       `;
     }
 
@@ -1628,29 +1622,27 @@
       `;
     }
 
-    _renderMapHero(entities, phase, zoneFeatures, selected, overlayProjection, highlightZones) {
+    _renderMapHero(entities, phase, zoneFeatures, selected, showShapePanel) {
       const st = entityState(this.hass, entities.map);
       const token = st?.attributes?.access_token || "";
       const src = cameraProxyUrl(this.hass, entities.map, token);
-      const projection =
-        overlayProjection || lymowMapProjection(null, zoneFeatureBounds(zoneFeatures));
       void this._mapTick;
       return html`
         <div class="hero map-hero ${phase}">
-          <div class="map-stack">
-            <div class="map-frame">
-              <img
-                src=${src}
-                alt="Lymow map"
-                draggable="false"
-                @error=${this._onMapError}
-              />
-              ${highlightZones && projection
-                ? this._renderMapZoneOverlay(zoneFeatures, selected, projection)
-                : nothing}
+          <div class="map-stack ${showShapePanel ? "with-shapes" : ""}">
+            <div class="map-frame-wrap">
+              <div class="map-frame">
+                <img
+                  src=${src}
+                  alt="Lymow map"
+                  draggable="false"
+                  @error=${this._onMapError}
+                />
+              </div>
+              <div class="map-badge">Live map</div>
             </div>
+            ${showShapePanel ? this._renderZoneShapePanel(zoneFeatures, selected) : nothing}
           </div>
-          <div class="map-badge">Live map</div>
         </div>
       `;
     }
@@ -1665,9 +1657,9 @@
       const img = heroArtPath(cfg, activity);
       const artSrc = mediaUrl(this.hass, img);
       const selected = this._selectedZoneSet();
-      const { zones: zoneFeatures, overlayProjection } = this._zoneFeatureData(cfg, entities);
+      const { zones: zoneFeatures } = this._zoneFeatureData(cfg, entities);
       const zonePickActive = cfg.show_zone_picker !== false && selected.size > 0;
-      const highlightZones = zonePickActive && zoneFeatures.length > 0;
+      const showShapePanel = zonePickActive && zoneFeatures.length > 0;
       const artFailed = Boolean(artSrc && this._artFailedSrc === artSrc);
 
       const useLiveMap =
@@ -1677,14 +1669,7 @@
         (mode === "map" || zonePickActive || !this._mapFailed);
 
       if (useLiveMap) {
-        return this._renderMapHero(
-          entities,
-          phase,
-          zoneFeatures,
-          selected,
-          overlayProjection,
-          highlightZones
-        );
+        return this._renderMapHero(entities, phase, zoneFeatures, selected, showShapePanel);
       }
 
       if (artOn && artSrc && !artFailed) {
@@ -2030,28 +2015,73 @@
           justify-content: center;
           width: 100%;
         }
+        .map-stack.with-shapes {
+          flex-direction: row;
+          align-items: flex-start;
+          gap: 10px;
+          max-width: 340px;
+          margin: 0 auto;
+        }
+        .map-frame-wrap {
+          position: relative;
+          flex: 0 0 auto;
+        }
+        .map-frame-wrap .map-badge {
+          position: absolute;
+          left: 8px;
+          bottom: 8px;
+          z-index: 2;
+        }
+        .map-stack.with-shapes .map-frame-wrap {
+          width: min(48%, 150px);
+        }
         .map-frame {
           position: relative;
           width: min(100%, 160px);
           aspect-ratio: 1;
           max-height: 160px;
-          overflow: visible;
+        }
+        .map-stack.with-shapes .map-frame {
+          width: 100%;
+          max-height: none;
         }
         .map-frame img {
           display: block;
           width: 100%;
           height: 100%;
-          object-fit: fill;
+          object-fit: contain;
           border-radius: 8px;
         }
-        .zone-overlay {
-          position: absolute;
-          inset: 0;
+        .zone-shape-panel {
+          position: relative;
+          flex: 0 0 auto;
+          width: min(48%, 150px);
+          aspect-ratio: 1;
+          border-radius: 8px;
+          background: radial-gradient(circle at 50% 45%, #14532d 0%, #0f172a 72%);
+          box-shadow: inset 0 0 0 1px rgba(34, 197, 94, 0.2);
+        }
+        .zone-shape-panel svg {
+          display: block;
           width: 100%;
           height: 100%;
+        }
+        .zone-shape-label {
+          position: absolute;
+          top: 5px;
+          left: 0;
+          right: 0;
+          z-index: 1;
+          text-align: center;
+          font-size: 0.62rem;
+          font-weight: 600;
+          color: #bbf7d0;
           pointer-events: none;
-          overflow: visible;
-          z-index: 3;
+        }
+        .map-stack.with-shapes .map-badge {
+          position: static;
+          margin-top: 4px;
+          text-align: center;
         }
         .geo-hero .dimmed {
           fill: rgba(0, 0, 0, 0.22);
