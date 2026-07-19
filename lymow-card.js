@@ -699,8 +699,8 @@
 
     if (mode === "enu") return rawRing;
 
-    // Lymow-HA emits WGS84 [lon, lat] when has_gps_origin is true.
-    if (attrs?.has_gps_origin && origin) {
+    // Lymow-HA emits WGS84 [lon, lat] when has_gps_origin is true (or coords look geographic).
+    if (origin && (attrs?.has_gps_origin || ringLooksLikeWgs84(rawRing))) {
       return latLonRingToEnu(rawRing, origin.lat0, origin.lon0);
     }
 
@@ -769,10 +769,44 @@
     };
   }
 
-  /** Map camera render_debug matches Lymow-HA build_map_png bounds. */
-  function pickOverlayProjection(renderDebug, ringBounds) {
-    const mapProj = lymowMapProjection(renderDebug, ringBounds);
-    if (mapProj?.usesMapBounds) return mapProj;
+  function boundsSizeMatch(ringBounds, renderDebug) {
+    if (!ringBounds || !renderDebug) return false;
+    const rw = ringBounds.maxX - ringBounds.minX;
+    const rh = ringBounds.maxY - ringBounds.minY;
+    const dw = renderDebug.max_x - renderDebug.min_x;
+    const dh = renderDebug.max_y - renderDebug.min_y;
+    if (!rw || !rh || !dw || !dh) return false;
+    return Math.abs(rw / dw - 1) < 0.2 && Math.abs(rh / dh - 1) < 0.2;
+  }
+
+  /** Shift converted rings when scale matches map bounds but origin was rounded. */
+  function alignZonesToMapBounds(zones, renderDebug) {
+    if (!zones?.length || !renderDebug) return zones;
+    const rb = zoneFeatureBounds(zones);
+    if (!rb || !boundsSizeMatch(rb, renderDebug)) return zones;
+    if (zones.every((z) => ringMatchesMapBounds(z.ring, renderDebug))) return zones;
+
+    const dx = renderDebug.min_x - rb.minX;
+    const dy = renderDebug.min_y - rb.minY;
+    return zones.map((z) => ({
+      ...z,
+      ring: z.ring.map(([x, y]) => [x + dx, y + dy]),
+    }));
+  }
+
+  function zonesAlignToMap(zones, renderDebug) {
+    if (!zones?.length || !renderDebug) return false;
+    return zones.every((z) => ringMatchesMapBounds(z.ring, renderDebug));
+  }
+
+  /** Use map camera bounds only when zone rings already sit in that ENU frame. */
+  function pickOverlayProjection(renderDebug, ringBounds, zones) {
+    const dbgOk =
+      renderDebug &&
+      ["min_x", "max_x", "min_y", "max_y"].every((k) => Number.isFinite(renderDebug[k]));
+    if (dbgOk && zonesAlignToMap(zones, renderDebug)) {
+      return lymowMapProjection(renderDebug, ringBounds);
+    }
     return lymowMapProjection(null, ringBounds);
   }
 
@@ -864,9 +898,10 @@
       return a.index - b.index;
     });
 
-    const ringBounds = zoneFeatureBounds(zones);
-    const overlayProjection = pickOverlayProjection(renderDebug, ringBounds);
-    return { zones, overlayProjection };
+    const alignedZones = alignZonesToMapBounds(zones, renderDebug);
+    const ringBounds = zoneFeatureBounds(alignedZones);
+    const overlayProjection = pickOverlayProjection(renderDebug, ringBounds, alignedZones);
+    return { zones: alignedZones, overlayProjection };
   }
 
   function zoneFeatureBounds(zoneFeatures) {
