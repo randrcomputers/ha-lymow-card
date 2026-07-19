@@ -1025,9 +1025,11 @@
           @click=${() => this._toggleHeadlights(entities)}
         >
           <svg viewBox="0 0 24 24" aria-hidden="true">
+            <rect x="3" y="7" width="8" height="10" rx="2" fill="currentColor" />
             <path
               fill="currentColor"
-              d="M5.5 7.5A6.5 6.5 0 0 1 12 1a6.5 6.5 0 0 1 6.5 6.5c0 .74-.12 1.45-.35 2.11l2.14 2.14a1 1 0 0 1-1.42 1.42l-1.36-1.36A6.47 6.47 0 0 1 12 14a6.5 6.5 0 0 1-6.5-6.5m0 2A4.5 4.5 0 0 0 12 12a4.5 4.5 0 0 0 4.5-4.5A4.5 4.5 0 0 0 12 3 4.5 4.5 0 0 0 7.5 7.5M2 20v-2h4.75l-1.4-3.5 1.86-1.86L9.83 18H22v2H2Z"
+              d="M13 9.5h8v1.75H13V9.5zm0 3.375h6.5v1.75H13v-1.75zm0 3.375h5v1.75H13V16.25z"
+              opacity=${on ? "1" : "0.45"}
             />
           </svg>
         </button>
@@ -1431,30 +1433,30 @@
           flex-shrink: 0;
         }
         .headlights-btn {
+          width: 28px;
+          height: 28px;
+          padding: 0;
+          border: none;
+          border-radius: 50%;
           display: inline-flex;
           align-items: center;
           justify-content: center;
-          width: 32px;
-          height: 32px;
-          padding: 0;
-          border: 1px solid var(--divider-color, rgba(255, 255, 255, 0.12));
-          border-radius: 8px;
           background: var(--secondary-background-color);
-          color: var(--secondary-text-color);
+          color: var(--disabled-text-color);
           cursor: pointer;
         }
         .headlights-btn.on {
           color: #fde047;
-          border-color: rgba(253, 224, 71, 0.45);
-          background: rgba(253, 224, 71, 0.12);
+          background: rgba(253, 224, 71, 0.14);
+          box-shadow: 0 0 10px rgba(253, 224, 71, 0.35);
         }
         .headlights-btn:disabled {
           opacity: 0.45;
           cursor: not-allowed;
         }
         .headlights-btn svg {
-          width: 18px;
-          height: 18px;
+          width: 16px;
+          height: 16px;
         }
         .battery {
           display: flex;
