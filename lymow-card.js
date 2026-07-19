@@ -862,10 +862,11 @@
     }));
   }
 
-  function zoneSelectionSummary(selected, total) {
-    if (!selected?.size) return "All zones";
+  function zoneSelectionSummary(selected, total, mowAll) {
+    if (mowAll) return "All zones";
+    if (!selected?.size) return "No zones selected";
     if (selected.size === 1) return "1 zone selected";
-    if (selected.size === total) return "All zones";
+    if (selected.size === total) return `${total} zones selected`;
     return `${selected.size} zones selected`;
   }
 
@@ -880,6 +881,7 @@
         _mapFailed: { state: false },
         _artFailedSrc: { state: null },
         _selectedZones: { state: true },
+        _mowAllZones: { state: true },
       };
     }
 
@@ -912,6 +914,7 @@
     setConfig(config) {
       this.config = mergeConfig(config);
       this._selectedZones = this._selectedZones || new Set();
+      this._mowAllZones = this._mowAllZones || false;
     }
 
     _zoneList(cfg, entities) {
@@ -936,6 +939,7 @@
     }
 
     _toggleZone(zoneId) {
+      this._mowAllZones = false;
       const next = new Set(this._selectedZoneSet());
       if (next.has(zoneId)) next.delete(zoneId);
       else next.add(zoneId);
@@ -944,10 +948,16 @@
       this.requestUpdate();
     }
 
-    _clearZoneSelection() {
+    _selectAllZones() {
+      this._mowAllZones = true;
       this._selectedZones = new Set();
       this._mapFailed = false;
       this.requestUpdate();
+    }
+
+    _hasStartSelection(cfg) {
+      if (cfg.show_zone_picker === false) return true;
+      return this._mowAllZones || this._selectedZoneSet().size > 0;
     }
 
     connectedCallback() {
@@ -1029,6 +1039,7 @@
       const selected = this._selectedZoneSet();
       const useZones =
         cfg.show_zone_picker !== false &&
+        !this._mowAllZones &&
         hasStartZonesService(this.hass) &&
         selected.size > 0 &&
         zones.length > 0;
@@ -1280,7 +1291,7 @@
       if (!zones.length) return nothing;
 
       const selected = this._selectedZoneSet();
-      const summary = zoneSelectionSummary(selected, zones.length);
+      const summary = zoneSelectionSummary(selected, zones.length, this._mowAllZones);
 
       return html`
         <div class="zones">
@@ -1291,9 +1302,9 @@
           <div class="zone-chips">
             <button
               type="button"
-              class="zone-chip all ${selected.size === 0 ? "on" : ""}"
+              class="zone-chip all ${this._mowAllZones ? "on" : ""}"
               ?disabled=${this._busy}
-              @click=${() => this._clearZoneSelection()}
+              @click=${() => this._selectAllZones()}
               title="Start full map (lawn_mower.start_mowing)"
             >
               All
@@ -1302,7 +1313,7 @@
               (z) => html`
                 <button
                   type="button"
-                  class="zone-chip ${selected.has(z.id) ? "on" : ""}"
+                  class="zone-chip ${!this._mowAllZones && selected.has(z.id) ? "on" : ""}"
                   ?disabled=${this._busy}
                   @click=${() => this._toggleZone(z.id)}
                   title=${z.id}
@@ -1312,9 +1323,11 @@
               `
             )}
           </div>
-          ${selected.size > 0
-            ? html`<p class="zones-hint">Start mows selected zones only.</p>`
-            : html`<p class="zones-hint">Pick zones, or leave <strong>All</strong> for full map.</p>`}
+          ${this._mowAllZones
+            ? html`<p class="zones-hint">Start mows the full map.</p>`
+            : selected.size > 0
+              ? html`<p class="zones-hint">Start mows selected zones only.</p>`
+              : html`<p class="zones-hint">Select zones to mow, or tap <strong>All</strong> for full map.</p>`}
         </div>
       `;
     }
@@ -1547,7 +1560,8 @@
             ? `Start (${this._selectedZoneSet().size})`
             : "Start";
       const primaryAction = showPause ? "pause" : "start_mowing";
-      const primaryEnabled = showPause || showResume || showStart;
+      const primaryEnabled =
+        showPause || showResume || (showStart && this._hasStartSelection(cfg));
 
       return html`
         <ha-card>
