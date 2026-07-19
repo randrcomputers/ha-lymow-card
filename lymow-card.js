@@ -657,11 +657,13 @@
     if (![min_x, max_x, min_y, max_y].every(Number.isFinite)) return null;
     const scale = (W - PAD * 2) / Math.max(max_x - min_x || 1, max_y - min_y || 1);
     return {
+      toPoint(x, y) {
+        return [(x - min_x) * scale + PAD, H - ((y - min_y) * scale + PAD)];
+      },
       toPoints(ring) {
         return ring
           .map(([x, y]) => {
-            const nx = (x - min_x) * scale + PAD;
-            const ny = H - ((y - min_y) * scale + PAD);
+            const [nx, ny] = this.toPoint(x, y);
             return `${nx.toFixed(2)},${ny.toFixed(2)}`;
           })
           .join(" ");
@@ -674,8 +676,19 @@
     return ring.map(([lon, lat]) => {
       const north_m = ((lat - lat0) * Math.PI) / 180 * WGS84_A;
       const east_m = ((lon - lon0) * Math.PI) / 180 * WGS84_A * Math.cos(latRad);
-      return [north_m, east_m];
+      // Lymow map coordinates: x = east, y = north (matches Lymow-HA _enu_to_latlon).
+      return [east_m, north_m];
     });
+  }
+
+  function ringCentroid(ring) {
+    let sx = 0;
+    let sy = 0;
+    for (const [x, y] of ring) {
+      sx += x;
+      sy += y;
+    }
+    return [sx / ring.length, sy / ring.length];
   }
 
   function ringCoordMode(feature) {
@@ -728,7 +741,14 @@
       seen.add(id);
       const index = zones.length;
       const name = zoneDisplayName(p, String(id), index);
-      zones.push({ id: String(id), name, index, ring });
+      const zoneNum = name.match(/^Zone\s+(\d+)$/i);
+      zones.push({
+        id: String(id),
+        name,
+        shortLabel: zoneNum ? zoneNum[1] : name.slice(0, 8),
+        index,
+        ring,
+      });
     }
 
     zones.sort((a, b) => {
@@ -787,7 +807,7 @@
         _mapTick: { state: 0 },
         _mapFailed: { state: false },
         _artFailedSrc: { state: null },
-        _selectedZones: { state: null },
+        _selectedZones: { state: true },
       };
     }
 
@@ -848,10 +868,12 @@
       if (next.has(zoneId)) next.delete(zoneId);
       else next.add(zoneId);
       this._selectedZones = next;
+      this.requestUpdate();
     }
 
     _clearZoneSelection() {
       this._selectedZones = new Set();
+      this.requestUpdate();
     }
 
     connectedCallback() {
@@ -1223,17 +1245,32 @@
       `;
     }
 
-    _renderZoneHighlightSvg(zoneFeatures, selected, projection) {
-      if (!selected?.size || !zoneFeatures?.length || !projection) return nothing;
-      const picked = zoneFeatures.filter((z) => selected.has(z.id));
-      if (!picked.length) return nothing;
+    _renderMapZoneOverlay(zoneFeatures, selected, projection) {
+      if (!zoneFeatures?.length || !projection || !selected?.size) return nothing;
       return html`
         <svg class="zone-overlay" viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
-          ${picked.map((z) => {
+          ${zoneFeatures.map((z) => {
             const pts = projection.toPoints(z.ring);
+            const on = selected.has(z.id);
+            const [cx, cy] = projection.toPoint(...ringCentroid(z.ring));
             return html`
-              <polygon points=${pts} class="selected-glow"></polygon>
-              <polygon points=${pts} class="selected"></polygon>
+              ${!on
+                ? html`<polygon points=${pts} class="zone-dim"></polygon>`
+                : nothing}
+              ${on
+                ? html`
+                    <polygon points=${pts} class="zone-glow"></polygon>
+                    <polygon points=${pts} class="zone-selected"></polygon>
+                    <circle class="zone-check-bg" cx=${cx.toFixed(2)} cy=${cy.toFixed(2)} r="4.2"></circle>
+                    <path
+                      class="zone-check-mark"
+                      d="M ${(cx - 1.8).toFixed(2)} ${cy.toFixed(2)} L ${(cx - 0.4).toFixed(2)} ${(cy + 1.4).toFixed(2)} L ${(cx + 2.2).toFixed(2)} ${(cy - 1.6).toFixed(2)}"
+                    ></path>
+                  `
+                : nothing}
+              <text x=${cx.toFixed(2)} y=${(cy + (on ? 7.5 : 3)).toFixed(2)} class="zone-label ${on ? "on" : ""}">
+                ${z.shortLabel || z.name}
+              </text>
             `;
           })}
         </svg>
@@ -1252,11 +1289,30 @@
             ${zoneFeatures.map((z) => {
               const on = !hasSelection || selected.has(z.id);
               const pts = proj.toPoints(z.ring);
+              const [cx, cy] = proj.toPoint(...ringCentroid(z.ring));
               return html`
-                <polygon
-                  points=${pts}
-                  class=${on && hasSelection ? "selected" : hasSelection ? "dimmed" : "idle"}
-                ></polygon>
+                ${hasSelection && !on
+                  ? html`<polygon points=${pts} class="dimmed"></polygon>`
+                  : nothing}
+                ${hasSelection && on
+                  ? html`
+                      <polygon points=${pts} class="zone-glow"></polygon>
+                      <polygon points=${pts} class="selected"></polygon>
+                      <circle class="zone-check-bg" cx=${cx.toFixed(2)} cy=${cy.toFixed(2)} r="4.2"></circle>
+                      <path
+                        class="zone-check-mark"
+                        d="M ${(cx - 1.8).toFixed(2)} ${cy.toFixed(2)} L ${(cx - 0.4).toFixed(2)} ${(cy + 1.4).toFixed(2)} L ${(cx + 2.2).toFixed(2)} ${(cy - 1.6).toFixed(2)}"
+                      ></path>
+                    `
+                  : nothing}
+                ${!hasSelection ? html`<polygon points=${pts} class="idle"></polygon>` : nothing}
+                ${hasSelection
+                  ? html`
+                      <text x=${cx.toFixed(2)} y=${(cy + (on ? 7.5 : 3)).toFixed(2)} class="zone-label ${on ? "on" : ""}">
+                        ${z.shortLabel || z.name}
+                      </text>
+                    `
+                  : nothing}
               `;
             })}
           </svg>
@@ -1280,7 +1336,7 @@
               @error=${this._onMapError}
             />
             ${highlightZones
-              ? this._renderZoneHighlightSvg(zoneFeatures, selected, projection)
+              ? this._renderMapZoneOverlay(zoneFeatures, selected, projection)
               : nothing}
           </div>
           <div class="map-badge">Live map</div>
@@ -1655,39 +1711,72 @@
           border-radius: 8px;
         }
         .map-stack {
-          display: grid;
-          width: 100%;
-          max-height: 160px;
-          place-items: center;
-        }
-        .map-stack > img,
-        .map-stack > svg {
-          grid-area: 1 / 1;
+          position: relative;
+          display: flex;
+          align-items: center;
+          justify-content: center;
           width: 100%;
           max-height: 160px;
         }
         .map-stack img {
-          object-fit: contain;
           display: block;
+          width: 100%;
+          max-height: 160px;
+          object-fit: contain;
           border-radius: 8px;
-          z-index: 1;
         }
         .zone-overlay {
-          z-index: 2;
+          position: absolute;
+          inset: 0;
+          width: 100%;
+          height: 100%;
+          max-height: 160px;
           pointer-events: none;
           overflow: visible;
+          z-index: 2;
         }
-        .zone-overlay .selected-glow {
-          fill: rgba(250, 204, 21, 0.25);
-          stroke: rgba(254, 240, 138, 0.9);
-          stroke-width: 3;
+        .zone-overlay .zone-dim {
+          fill: rgba(15, 23, 42, 0.45);
+          stroke: rgba(255, 255, 255, 0.35);
+          stroke-width: 0.55;
         }
-        .zone-overlay .selected {
-          fill: rgba(250, 204, 21, 0.5);
-          stroke: #fff;
-          stroke-width: 1.4;
+        .zone-overlay .zone-glow {
+          fill: rgba(59, 130, 246, 0.28);
+          stroke: rgba(147, 197, 253, 0.95);
+          stroke-width: 2.4;
         }
-        .zone-overlay .dimmed,
+        .zone-overlay .zone-selected {
+          fill: rgba(37, 99, 235, 0.55);
+          stroke: #ffffff;
+          stroke-width: 1.6;
+        }
+        .zone-overlay .zone-check-bg {
+          fill: #1d4ed8;
+          stroke: #ffffff;
+          stroke-width: 0.7;
+        }
+        .zone-overlay .zone-check-mark {
+          fill: none;
+          stroke: #ffffff;
+          stroke-width: 1.3;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+        }
+        .zone-overlay .zone-label {
+          fill: rgba(255, 255, 255, 0.88);
+          font-size: 4.5px;
+          font-weight: 700;
+          text-anchor: middle;
+          paint-order: stroke fill;
+          stroke: rgba(0, 0, 0, 0.75);
+          stroke-width: 0.55;
+        }
+        .zone-overlay .zone-label.on {
+          fill: #ffffff;
+          font-size: 5px;
+          stroke: rgba(29, 78, 216, 0.95);
+          stroke-width: 0.7;
+        }
         .geo-hero .dimmed {
           fill: rgba(0, 0, 0, 0.22);
           stroke: rgba(255, 255, 255, 0.1);
@@ -1702,9 +1791,39 @@
           display: block;
         }
         .geo-hero .selected {
-          fill: rgba(250, 204, 21, 0.5);
-          stroke: #fef9c3;
-          stroke-width: 1.4;
+          fill: rgba(37, 99, 235, 0.55);
+          stroke: #ffffff;
+          stroke-width: 1.6;
+        }
+        .geo-hero .zone-glow {
+          fill: rgba(59, 130, 246, 0.28);
+          stroke: rgba(147, 197, 253, 0.95);
+          stroke-width: 2.4;
+        }
+        .geo-hero .zone-check-bg {
+          fill: #1d4ed8;
+          stroke: #ffffff;
+          stroke-width: 0.7;
+        }
+        .geo-hero .zone-check-mark {
+          fill: none;
+          stroke: #ffffff;
+          stroke-width: 1.3;
+          stroke-linecap: round;
+          stroke-linejoin: round;
+        }
+        .geo-hero .zone-label {
+          fill: rgba(255, 255, 255, 0.88);
+          font-size: 4.5px;
+          font-weight: 700;
+          text-anchor: middle;
+          paint-order: stroke fill;
+          stroke: rgba(0, 0, 0, 0.75);
+          stroke-width: 0.55;
+        }
+        .geo-hero .zone-label.on {
+          fill: #ffffff;
+          font-size: 5px;
         }
         .geo-hero .idle {
           fill: rgba(34, 197, 94, 0.22);
