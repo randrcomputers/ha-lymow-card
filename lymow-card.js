@@ -19,6 +19,7 @@
     show_zone_picker: true,
     show_headlights: true,
     map_refresh_seconds: 30,
+    units: "metric",
   });
 
   const ENTITY_SUFFIXES = {
@@ -105,8 +106,54 @@
     if (!String(c.image_mower || "").trim()) c.image_mower = DEFAULTS.image_mower;
     if (!String(c.image_dock || "").trim()) c.image_dock = DEFAULTS.image_dock;
     c.hero_mode = normalizeHeroMode(c.hero_mode);
+    c.units = normalizeUnits(c.units);
     c.show_map = cfgBool(c.show_map, DEFAULTS.show_map);
     return c;
+  }
+
+  function normalizeUnits(value) {
+    const raw = String(value ?? DEFAULTS.units).trim().toLowerCase();
+    if (raw === "imperial" || raw === "us" || raw === "us_customary") return "imperial";
+    if (raw === "auto") return "auto";
+    return "metric";
+  }
+
+  function isImperial(hass, cfg) {
+    const mode = normalizeUnits(cfg?.units);
+    if (mode === "imperial") return true;
+    if (mode === "metric") return false;
+    const us = hass?.config?.unit_system;
+    return us?.system === "us_customary" || us?.length === "mi";
+  }
+
+  function parseNumericText(raw) {
+    if (raw == null || raw === "—" || raw === "") return null;
+    const n = Number(String(raw).replace(/,/g, "").trim());
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function formatCount(n, decimals = 0) {
+    return n.toLocaleString(undefined, {
+      maximumFractionDigits: decimals,
+      minimumFractionDigits: decimals,
+    });
+  }
+
+  function formatAreaStat(hass, cfg, raw) {
+    const n = parseNumericText(raw);
+    if (n == null) return null;
+    if (!isImperial(hass, cfg)) return `${formatCount(n)} m²`;
+    const sqft = n * 10.7639104167;
+    if (sqft >= 43560) return `${formatCount(sqft / 43560, 2)} ac`;
+    return `${formatCount(Math.round(sqft))} ft²`;
+  }
+
+  function formatBladeHeightStat(hass, cfg, raw) {
+    if (raw === "—") return raw;
+    const n = parseNumericText(raw);
+    if (n == null) return String(raw);
+    if (!isImperial(hass, cfg)) return `${formatCount(n)} mm`;
+    return `${formatCount(n / 25.4, 2)} in`;
   }
 
   function normalizeHeroMode(value) {
@@ -1044,17 +1091,21 @@
       `;
     }
 
-    _renderStats(hass, entities) {
+    _renderStats(hass, entities, cfg) {
       const items = [];
       const areaEntity = entities.area || entities.map_area;
       const areaLabel = entities.area ? "Area" : entities.map_area ? "Map" : "Area";
-      const area = textState(hass, areaEntity, "");
-      if (areaEntity && area && area !== "—") {
-        items.push({ label: areaLabel, value: `${area} m²` });
+      const areaRaw = textState(hass, areaEntity, "");
+      const areaFormatted = areaRaw && areaRaw !== "—" ? formatAreaStat(hass, cfg, areaRaw) : null;
+      if (areaEntity && areaFormatted) {
+        items.push({ label: areaLabel, value: areaFormatted });
       }
       if (entities.blade) {
         const blade = textState(hass, entities.blade, "—");
-        items.push({ label: "Height", value: blade === "—" ? blade : `${blade} mm` });
+        items.push({
+          label: "Height",
+          value: blade === "—" ? blade : formatBladeHeightStat(hass, cfg, blade),
+        });
       }
       if (entities.rtk) {
         items.push({ label: "RTK", value: textState(hass, entities.rtk, "—") });
@@ -1400,7 +1451,7 @@
 
             ${this._renderAlerts(this.hass, entities)}
             ${this._renderProgress(this.hass, entities, activity)}
-            ${cfg.show_stats ? this._renderStats(this.hass, entities) : nothing}
+            ${cfg.show_stats ? this._renderStats(this.hass, entities, cfg) : nothing}
 
             ${this._renderZonePicker(cfg, entities, showStart)}
 
@@ -1957,6 +2008,7 @@
               type: "custom:lymow-card",
               ...value,
               hero_mode: normalizeHeroMode(value.hero_mode),
+              units: normalizeUnits(value.units),
             },
           },
         })
@@ -2004,6 +2056,18 @@
                 },
               },
             },
+            {
+              name: "units",
+              selector: {
+                select: {
+                  options: [
+                    { value: "metric", label: "Metric (m², mm)" },
+                    { value: "imperial", label: "Imperial (ft²/ac, in)" },
+                    { value: "auto", label: "Auto (follow Home Assistant)" },
+                  ],
+                },
+              },
+            },
             { name: "show_map", selector: { boolean: {} } },
             { name: "show_stats", selector: { boolean: {} } },
             { name: "show_mow_mode", selector: { boolean: {} } },
@@ -2038,6 +2102,7 @@
               entity_btn_dock_cancel: "Dock & cancel button",
               name: "Card title override",
               hero_mode: "Hero area layout",
+              units: "Units for area and blade height",
               show_map: "Auto mode only — show map while mowing",
               show_stats: "Show stats row (area, height, RTK)",
               show_mow_mode: "Show mow pattern selector",
