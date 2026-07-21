@@ -1,7 +1,7 @@
 /**
  * Lymow Card — Home Assistant Lovelace (Lymow-HA integration).
  * Tailored dashboard card for Lymow One Plus and other Lymow mowers.
- * @version 29
+ * @version 30
  */
 (function () {
   const LitElement = Object.getPrototypeOf(customElements.get("ha-panel-lovelace"));
@@ -114,6 +114,93 @@
     if (isActiveRun(activity)) return showShapePanel ? "large" : "full";
     if (showShapePanel) return "compact";
     return "large";
+  }
+
+  const MAP_LAYOUT = {
+    compact: { map: 120, stack: 260, shape: 120, column: false },
+    large: { map: 280, stack: 580, shape: 280, column: false },
+    full: { map: 400, stack: 720, shape: 400, column: true },
+  };
+
+  function mapLayoutTokens(mapSize) {
+    return MAP_LAYOUT[mapSize] || MAP_LAYOUT.large;
+  }
+
+  const MOW_ZONES_STORAGE = "lymow-card:active-mow-zones";
+
+  function mowZonesStorageKey(mowerEntityId) {
+    return `${MOW_ZONES_STORAGE}:${mowerEntityId || "unknown"}`;
+  }
+
+  function saveActiveMowZones(mowerEntityId, zoneIds, allZones) {
+    if (!mowerEntityId) return;
+    try {
+      localStorage.setItem(
+        mowZonesStorageKey(mowerEntityId),
+        JSON.stringify({
+          zoneIds: [...zoneIds],
+          allZones: !!allZones,
+          savedAt: Date.now(),
+        })
+      );
+    } catch {
+      /* private mode / quota */
+    }
+  }
+
+  function loadActiveMowZones(mowerEntityId) {
+    if (!mowerEntityId) return null;
+    try {
+      const raw = localStorage.getItem(mowZonesStorageKey(mowerEntityId));
+      if (!raw) return null;
+      const data = JSON.parse(raw);
+      if (!data || !Array.isArray(data.zoneIds)) return null;
+      return {
+        zoneIds: new Set(data.zoneIds.map(String)),
+        allZones: !!data.allZones,
+      };
+    } catch {
+      return null;
+    }
+  }
+
+  function clearActiveMowZones(mowerEntityId) {
+    if (!mowerEntityId) return;
+    try {
+      localStorage.removeItem(mowZonesStorageKey(mowerEntityId));
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** Best-effort read of active mow zones from HA entity attributes. */
+  function inferMowZonesFromEntities(hass, entities, knownZoneIds) {
+    const ids = new Set();
+    let all = false;
+    const sources = [entities.mower, entities.status].filter(Boolean);
+    for (const entityId of sources) {
+      const attrs = entityState(hass, entityId)?.attributes || {};
+      for (const key of [
+        "clean_zone_ids",
+        "cleanZoneIds",
+        "mowing_zones",
+        "active_zones",
+        "zones",
+      ]) {
+        const value = attrs[key];
+        if (!Array.isArray(value)) continue;
+        for (const z of value) {
+          const id = String(z);
+          if (!knownZoneIds.size || knownZoneIds.has(id)) ids.add(id);
+        }
+      }
+      if (attrs.area_or_global === true || attrs.mow_all === true || attrs.all_zones === true) {
+        all = true;
+      }
+    }
+    if (all && !ids.size) return { zoneIds: new Set(), allZones: true };
+    if (ids.size) return { zoneIds: ids, allZones: false };
+    return null;
   }
 
   /** When to show the side zone schematic and which zones to highlight. */
@@ -1370,11 +1457,33 @@
       return this._mowingZoneIds;
     }
 
-    _syncMowingZoneState(activity) {
+    _syncMowingZoneState(activity, mowerEntityId) {
       if (isActiveRun(activity)) return;
       if (this._mowingZoneSet().size || this._mowingAllZones) {
         this._mowingZoneIds = new Set();
         this._mowingAllZones = false;
+      }
+      clearActiveMowZones(mowerEntityId);
+    }
+
+    _restoreMowingZonesFromStorage(cfg, entities, activity) {
+      if (!entities?.mower || !isActiveRun(activity)) return;
+      if (this._mowingZoneSet().size || this._mowingAllZones) return;
+
+      const saved = loadActiveMowZones(entities.mower);
+      if (saved) {
+        this._mowingZoneIds = new Set(saved.zoneIds);
+        this._mowingAllZones = saved.allZones;
+        return;
+      }
+
+      const zones = this._zoneList(cfg, entities);
+      const known = new Set(zones.map((z) => z.id));
+      const inferred = inferMowZonesFromEntities(this.hass, entities, known);
+      if (inferred) {
+        this._mowingZoneIds = new Set(inferred.zoneIds);
+        this._mowingAllZones = inferred.allZones;
+        saveActiveMowZones(entities.mower, inferred.zoneIds, inferred.allZones);
       }
     }
 
@@ -1416,6 +1525,11 @@
       super.connectedCallback();
       this._startMapTimer();
       this._scheduleZoneShapePaint();
+      if (this.hass && this.config) {
+        const cfg = mergeConfig(this.config);
+        const entities = resolveEntities(this.hass, cfg);
+        this._restoreMowingZonesFromStorage(cfg, entities, mowerActivity(this.hass, entities));
+      }
     }
 
     disconnectedCallback() {
@@ -1456,8 +1570,11 @@
         this._scheduleZoneShapePaint();
       }
       if (changed.has("hass")) {
-        const entities = resolveEntities(this.hass, mergeConfig(this.config));
-        this._syncMowingZoneState(mowerActivity(this.hass, entities));
+        const cfg = mergeConfig(this.config);
+        const entities = resolveEntities(this.hass, cfg);
+        const activity = mowerActivity(this.hass, entities);
+        this._restoreMowingZonesFromStorage(cfg, entities, activity);
+        this._syncMowingZoneState(activity, entities.mower);
       }
     }
 
@@ -1548,10 +1665,12 @@
           await this._call("lymow", "start_zones", payload);
           this._mowingZoneIds = new Set(selected);
           this._mowingAllZones = false;
+          saveActiveMowZones(entities.mower, selected, false);
         } else {
           await this._call("lawn_mower", "start_mowing", { entity_id: entities.mower });
           this._mowingZoneIds = new Set();
           this._mowingAllZones = true;
+          saveActiveMowZones(entities.mower, [], true);
         }
       } finally {
         this._busy = false;
@@ -1832,7 +1951,7 @@
     _renderZoneShapePanel(label) {
       if (!label) return nothing;
       return html`
-        <div class="zone-shape-panel" data-card-version="29" aria-label="Zone shapes">
+        <div class="zone-shape-panel" data-card-version="30" aria-label="Zone shapes">
           <div class="zone-shape-label">${label}</div>
           <canvas class="zone-shape-canvas"></canvas>
         </div>
@@ -1923,9 +2042,14 @@
       const src = cameraProxyUrl(this.hass, entities.map, token);
       void this._mapTick;
       const showShapePanel = shapePanel?.show;
+      const tokens = mapLayoutTokens(mapSize);
+      const stackColumn = showShapePanel && tokens.column;
       return html`
-        <div class="hero map-hero map-size-${mapSize} ${phase}">
-          <div class="map-stack ${showShapePanel ? "with-shapes" : ""}">
+        <div
+          class="hero map-hero map-size-${mapSize} ${phase}"
+          style="--map-size-px: ${tokens.map}px; --map-stack-max-px: ${tokens.stack}px; --shape-size-px: ${tokens.shape}px;"
+        >
+          <div class="map-stack ${showShapePanel ? "with-shapes" : ""} ${stackColumn ? "stack-column" : ""}">
             <div class="map-frame-wrap">
               <div
                 class="map-frame zoomable"
@@ -2313,6 +2437,9 @@
           display: flex;
           flex-direction: column;
           align-items: center;
+          --map-size-px: 160px;
+          --map-stack-max-px: 340px;
+          --shape-size-px: 150px;
         }
         .map-stack {
           display: flex;
@@ -2323,8 +2450,12 @@
           flex-direction: row;
           align-items: flex-start;
           gap: 10px;
-          max-width: 340px;
+          max-width: min(100%, var(--map-stack-max-px));
           margin: 0 auto;
+        }
+        .map-stack.with-shapes.stack-column {
+          flex-direction: column;
+          align-items: center;
         }
         .map-frame-wrap {
           position: relative;
@@ -2337,17 +2468,20 @@
           z-index: 2;
         }
         .map-stack.with-shapes .map-frame-wrap {
-          width: min(48%, 150px);
+          width: min(48%, var(--shape-size-px));
+        }
+        .map-stack.with-shapes.stack-column .map-frame-wrap {
+          width: min(100%, var(--map-size-px));
         }
         .map-frame {
           position: relative;
-          width: min(100%, 160px);
+          width: min(100%, var(--map-size-px));
           aspect-ratio: 1;
-          max-height: 160px;
+          max-height: var(--map-size-px);
         }
         .map-stack.with-shapes .map-frame {
           width: 100%;
-          max-height: none;
+          max-height: var(--map-size-px);
         }
         .map-frame img {
           display: block;
@@ -2377,24 +2511,6 @@
         .map-frame.zoomable:hover .map-zoom-hint,
         .map-frame.zoomable:focus-within .map-zoom-hint {
           opacity: 1;
-        }
-        .map-hero.map-size-large .map-frame {
-          width: min(100%, 240px);
-          max-height: 240px;
-        }
-        .map-hero.map-size-large .map-stack.with-shapes {
-          max-width: 520px;
-        }
-        .map-hero.map-size-large .map-stack.with-shapes .map-frame-wrap,
-        .map-hero.map-size-large .zone-shape-panel {
-          width: min(48%, 240px);
-        }
-        .map-hero.map-size-full .map-stack {
-          max-width: 100%;
-        }
-        .map-hero.map-size-full .map-frame {
-          width: min(100%, 320px);
-          max-height: 320px;
         }
         .map-hero.map-size-full {
           min-height: 200px;
@@ -2445,7 +2561,7 @@
         .zone-shape-panel {
           position: relative;
           flex: 0 0 auto;
-          width: min(48%, 150px);
+          width: min(48%, var(--shape-size-px, 150px));
           aspect-ratio: 1;
           border-radius: 8px;
           background: #0f172a;
@@ -2453,6 +2569,9 @@
           display: flex;
           flex-direction: column;
           overflow: hidden;
+        }
+        .map-stack.with-shapes.stack-column .zone-shape-panel {
+          width: min(100%, var(--shape-size-px, 150px));
         }
         .zone-shape-panel canvas.zone-shape-canvas {
           display: block;
