@@ -1,6 +1,7 @@
 /**
  * Lymow Card — Home Assistant Lovelace (Lymow-HA integration).
  * Tailored dashboard card for Lymow One Plus and other Lymow mowers.
+ * @version 28
  */
 (function () {
   const LitElement = Object.getPrototypeOf(customElements.get("ha-panel-lovelace"));
@@ -754,29 +755,55 @@
   function wgs84SchematicProjection(rings) {
     const bounds = computeWgs84Bounds(rings);
     if (!bounds) return null;
+    return boundsSchematicProjection({
+      minX: bounds.minLon,
+      maxX: bounds.maxLon,
+      minY: bounds.minLat,
+      maxY: bounds.maxLat,
+    });
+  }
+
+  function ringBoundsFromRings(rings) {
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    let count = 0;
+    for (const ring of rings) {
+      if (!ring?.length) continue;
+      for (const [x, y] of ring) {
+        if (!Number.isFinite(x) || !Number.isFinite(y)) continue;
+        minX = Math.min(minX, x);
+        maxX = Math.max(maxX, x);
+        minY = Math.min(minY, y);
+        maxY = Math.max(maxY, y);
+        count += 1;
+      }
+    }
+    if (!count || !Number.isFinite(minX)) return null;
+    return { minX, maxX, minY, maxY };
+  }
+
+  function boundsSchematicProjection(bounds) {
+    if (!bounds) return null;
     const W = 100;
-    const PAD = 6;
-    const lonSpan = bounds.maxLon - bounds.minLon || 1e-9;
-    const latSpan = bounds.maxLat - bounds.minLat || 1e-9;
-    const scale = (W - PAD * 2) / Math.max(lonSpan, latSpan);
+    const PAD = 8;
+    const xSpan = bounds.maxX - bounds.minX || 1e-9;
+    const ySpan = bounds.maxY - bounds.minY || 1e-9;
+    const scale = (W - PAD * 2) / Math.max(xSpan, ySpan);
     return {
-      toPoint(lon, lat) {
-        return [(lon - bounds.minLon) * scale + PAD, W - ((lat - bounds.minLat) * scale + PAD)];
+      toPoint(x, y) {
+        return [(x - bounds.minX) * scale + PAD, W - ((y - bounds.minY) * scale + PAD)];
       },
       toPoints(ring) {
         return ring
-          .map(([lon, lat]) => {
-            const [nx, ny] = this.toPoint(lon, lat);
+          .map(([x, y]) => {
+            const [nx, ny] = this.toPoint(x, y);
             return `${nx.toFixed(2)},${ny.toFixed(2)}`;
           })
           .join(" ");
       },
     };
-  }
-
-  function schematicProjectionForZones(zoneFeatures) {
-    const rawRings = zoneFeatures.map((z) => z.rawRing || z.ring);
-    return wgs84SchematicProjection(rawRings) || lymowMapProjection(null, zoneFeatureBounds(zoneFeatures));
   }
 
   function ringMatchesMapBounds(ring, renderDebug) {
@@ -889,6 +916,115 @@
     return null;
   }
 
+  /** Outer rings from GeoJSON Polygon or MultiPolygon. */
+  function extractFeatureRings(geom) {
+    if (!geom) return [];
+    if (geom.type === "Polygon" && geom.coordinates?.[0]?.length) {
+      return [geom.coordinates[0]];
+    }
+    if (geom.type === "MultiPolygon" && Array.isArray(geom.coordinates)) {
+      return geom.coordinates.map((poly) => poly?.[0]).filter((ring) => ring?.length >= 3);
+    }
+    return [];
+  }
+
+  function ringToFlatPairs(ring) {
+    return ring
+      .map((pt) => [Number(pt[0]), Number(pt[1])])
+      .filter((pt) => Number.isFinite(pt[0]) && Number.isFinite(pt[1]));
+  }
+
+  function shapePanelProjection(zoneFeatures, renderDebug) {
+    const ringBounds = zoneFeatureBounds(zoneFeatures);
+    if (renderDebugReady(renderDebug) && ringBounds) {
+      return { proj: lymowMapProjection(renderDebug, ringBounds), ringKey: "ring" };
+    }
+    if (ringBounds && ringBounds.width > 0.01) {
+      return { proj: boundsSchematicProjection(ringBounds), ringKey: "ring" };
+    }
+    const rawRings = zoneFeatures.map((z) => z.rawRing).filter(Boolean);
+    const wgs = wgs84SchematicProjection(rawRings);
+    if (wgs) return { proj: wgs, ringKey: "rawRing" };
+    const generic = boundsSchematicProjection(ringBoundsFromRings(zoneFeatures.map((z) => z.rawRing || z.ring)));
+    return { proj: generic, ringKey: "rawRing" };
+  }
+
+  function paintZoneShapeCanvas(canvas, zoneFeatures, selected, renderDebug) {
+    if (!canvas || !zoneFeatures?.length) return false;
+    const picked = shapePanelProjection(zoneFeatures, renderDebug);
+    if (!picked?.proj) return false;
+
+    const cssSize = Math.max(canvas.clientWidth || 0, canvas.clientHeight || 0, 120);
+    const dpr = window.devicePixelRatio || 1;
+    const px = Math.round(cssSize * dpr);
+    if (canvas.width !== px || canvas.height !== px) {
+      canvas.width = px;
+      canvas.height = px;
+    }
+
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return false;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, cssSize, cssSize);
+
+    const scale = cssSize / 100;
+    const drawRing = (ring, style) => {
+      if (!ring?.length) return;
+      ctx.beginPath();
+      for (let i = 0; i < ring.length; i++) {
+        const [nx, ny] = picked.proj.toPoint(ring[i][0], ring[i][1]);
+        if (!Number.isFinite(nx) || !Number.isFinite(ny)) continue;
+        const x = nx * scale;
+        const y = ny * scale;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      }
+      ctx.closePath();
+      if (style.fill) {
+        ctx.fillStyle = style.fill;
+        ctx.fill();
+      }
+      ctx.strokeStyle = style.stroke;
+      ctx.lineWidth = style.lineWidth;
+      ctx.lineJoin = "round";
+      ctx.stroke();
+    };
+
+    let drew = 0;
+    for (const z of zoneFeatures) {
+      let ring = picked.ringKey === "rawRing" ? z.rawRing || z.ring : z.ring;
+      if (!ring?.length) continue;
+      const on = zoneIsSelected(z, selected);
+      if (!on) {
+        drawRing(ring, {
+          stroke: "rgba(148, 163, 184, 0.7)",
+          lineWidth: 1.2,
+        });
+        drew += 1;
+      }
+    }
+    for (const z of zoneFeatures) {
+      let ring = picked.ringKey === "rawRing" ? z.rawRing || z.ring : z.ring;
+      if (!ring?.length) continue;
+      if (!zoneIsSelected(z, selected)) continue;
+      drawRing(ring, {
+        fill: "rgba(34, 197, 94, 0.22)",
+        stroke: "#22c55e",
+        lineWidth: 2.8,
+      });
+      drew += 1;
+      const [cx, cy] = picked.proj.toPoint(...ringCentroid(ring));
+      if (Number.isFinite(cx) && Number.isFinite(cy)) {
+        ctx.fillStyle = "#ecfdf5";
+        ctx.font = "bold 12px system-ui, sans-serif";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "middle";
+        ctx.fillText(String(z.shortLabel || z.name), cx * scale, cy * scale);
+      }
+    }
+    return drew > 0;
+  }
+
   function ringsBoundsAlignToMap(zones, renderDebug) {
     const rb = zoneFeatureBounds(zones);
     if (!rb || !renderDebug) return false;
@@ -980,6 +1116,12 @@
       featureCollectionFeatures(attrs.geojson_zones) ||
       featureCollectionFeatures(attrs.geojson) ||
       [];
+    if (!features.length && Array.isArray(attrs.geojson_zones?.features)) {
+      features = attrs.geojson_zones.features;
+    }
+    if (!features.length && Array.isArray(attrs.geojson?.features)) {
+      features = attrs.geojson.features;
+    }
 
     const pending = [];
     for (const f of features) {
@@ -988,11 +1130,10 @@
       const id = p.hashId || p.hash_id || p.id;
       if (!id) continue;
       const geom = f.geometry;
-      if (!geom || geom.type !== "Polygon" || !geom.coordinates?.[0]?.length) continue;
+      const outerRings = extractFeatureRings(geom);
+      if (!outerRings.length) continue;
 
-      const rawRing = geom.coordinates[0]
-        .map((pt) => [Number(pt[0]), Number(pt[1])])
-        .filter((pt) => Number.isFinite(pt[0]) && Number.isFinite(pt[1]));
+      const rawRing = ringToFlatPairs(outerRings[0]);
       if (rawRing.length < 3) continue;
       pending.push({ f, p, id: String(id), rawRing });
     }
@@ -1189,11 +1330,16 @@
     connectedCallback() {
       super.connectedCallback();
       this._startMapTimer();
+      this._scheduleZoneShapePaint();
     }
 
     disconnectedCallback() {
       super.disconnectedCallback();
       this._stopMapTimer();
+      if (this._shapePaintRaf) {
+        cancelAnimationFrame(this._shapePaintRaf);
+        this._shapePaintRaf = null;
+      }
     }
 
     updated(changed) {
@@ -1214,6 +1360,36 @@
       if (this._pending && changed.has("hass")) {
         this._clearPendingIfDone();
       }
+      if (
+        changed.has("hass") ||
+        changed.has("_selectedZones") ||
+        changed.has("_mapTick") ||
+        changed.has("config")
+      ) {
+        this._scheduleZoneShapePaint();
+      }
+    }
+
+    _scheduleZoneShapePaint() {
+      if (this._shapePaintRaf) cancelAnimationFrame(this._shapePaintRaf);
+      this._shapePaintRaf = requestAnimationFrame(() => {
+        this._shapePaintRaf = null;
+        this._paintZoneShapePanel();
+      });
+    }
+
+    _paintZoneShapePanel() {
+      const canvas = this.shadowRoot?.querySelector("canvas.zone-shape-canvas");
+      if (!canvas || !this.hass) return;
+      const cfg = mergeConfig(this.config);
+      const selected = this._selectedZoneSet();
+      if (cfg.show_zone_picker === false || !selected.size) return;
+      const entities = resolveEntities(this.hass, cfg);
+      const { zones } = this._zoneFeatureData(cfg, entities);
+      if (!zones.length) return;
+      const mapSt = entityState(this.hass, entities.map);
+      const renderDebug = mapSt?.attributes?.render_debug || null;
+      paintZoneShapeCanvas(canvas, zones, selected, renderDebug);
     }
 
     _startMapTimer() {
@@ -1558,63 +1734,13 @@
       `;
     }
 
-    _renderZoneShapePanel(zoneFeatures, selected) {
-      if (!zoneFeatures?.length || !selected?.size) return nothing;
-      const proj = schematicProjectionForZones(zoneFeatures);
-      if (!proj) return nothing;
-
-      const shapes = [];
-      for (const z of zoneFeatures) {
-        const ring = z.rawRing || z.ring;
-        const pts = proj.toPoints(ring);
-        if (!pts || pts.includes("NaN")) continue;
-        const on = zoneIsSelected(z, selected);
-        const [cx, cy] = proj.toPoint(...ringCentroid(ring));
-        if (!Number.isFinite(cx) || !Number.isFinite(cy)) continue;
-        shapes.push({ z, pts, on, cx, cy });
-      }
-      if (!shapes.length) return nothing;
-
+    _renderZoneShapePanel(selected) {
+      if (!selected?.size) return nothing;
       const count = selected.size;
-      const idle = shapes.filter((s) => !s.on);
-      const active = shapes.filter((s) => s.on);
-
       return html`
-        <div class="zone-shape-panel" aria-label="Zone shapes">
+        <div class="zone-shape-panel" data-card-version="28" aria-label="Zone shapes">
           <div class="zone-shape-label">${count === 1 ? "1 zone" : `${count} zones`}</div>
-          <svg viewBox="0 0 100 100" preserveAspectRatio="xMidYMid meet" aria-hidden="true">
-            ${idle.map(
-              ({ pts }) => html`
-                <polygon
-                  .points=${pts}
-                  fill="none"
-                  stroke="rgba(148, 163, 184, 0.55)"
-                  stroke-width="1"
-                  stroke-linejoin="round"
-                ></polygon>
-              `
-            )}
-            ${active.map(({ z, pts, cx, cy }) => html`
-              <polygon
-                .points=${pts}
-                fill="none"
-                stroke="#22c55e"
-                stroke-width="2.8"
-                stroke-linejoin="round"
-              ></polygon>
-              <text
-                x=${cx.toFixed(2)}
-                y=${cy.toFixed(2)}
-                fill="#ecfdf5"
-                font-size="6"
-                font-weight="700"
-                text-anchor="middle"
-                dominant-baseline="middle"
-              >
-                ${z.shortLabel || z.name}
-              </text>
-            `)}
-          </svg>
+          <canvas class="zone-shape-canvas"></canvas>
         </div>
       `;
     }
@@ -1680,7 +1806,7 @@
               </div>
               <div class="map-badge">Live map</div>
             </div>
-            ${showShapePanel ? this._renderZoneShapePanel(zoneFeatures, selected) : nothing}
+            ${showShapePanel ? this._renderZoneShapePanel(selected) : nothing}
           </div>
         </div>
       `;
@@ -2099,17 +2225,20 @@
           border-radius: 8px;
           background: #0f172a;
           box-shadow: inset 0 0 0 1px rgba(34, 197, 94, 0.35);
+          display: flex;
+          flex-direction: column;
+          overflow: hidden;
         }
-        .zone-shape-panel svg {
+        .zone-shape-panel canvas.zone-shape-canvas {
           display: block;
+          flex: 1 1 auto;
           width: 100%;
-          height: 100%;
+          min-height: 0;
         }
         .zone-shape-label {
-          position: absolute;
-          top: 5px;
-          left: 0;
-          right: 0;
+          position: relative;
+          flex: 0 0 auto;
+          padding: 5px 4px 2px;
           z-index: 1;
           text-align: center;
           font-size: 0.62rem;

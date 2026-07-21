@@ -4,16 +4,11 @@ Lovelace card built for the **[Lymow-HA](https://github.com/d3dfantasy99/Lymow-H
 
 Replaces generic cards like [compact-lawn-mower-card](https://github.com/Tra1n84/compact-lawn-mower-card) with entity wiring and UI specific to Lymow.
 
-<img width="491" height="580" alt="image" src="https://github.com/user-attachments/assets/dd26e6be-e7b2-4442-818e-abe121c18b3a" />
-<img width="500" height="585" alt="image" src="https://github.com/user-attachments/assets/b4ed9b5f-0b11-43e5-a966-eecf513f5b02" />
-
-
-
 ## Features
 
 - **Lymow device picker** — auto-fills mower, status, battery, map camera, buttons, and more
 - **Live map hero** — integration map camera while mowing / returning (refreshes on an interval)
-- **Custom artwork** — transparent generic dock / empty-dock cutouts
+- **Custom artwork** — transparent generic dock / empty-dock cutouts (no outdoor background)
 - **Built-in silhouette** — Lymow-style SVG fallback when no images are configured
 - **Battery + online** — compact header with charging state
 - **Session progress bar** — uses `Session Progress` sensor during active runs
