@@ -1,7 +1,7 @@
 /**
  * Lymow Card — Home Assistant Lovelace (Lymow-HA integration).
  * Tailored dashboard card for Lymow One Plus and other Lymow mowers.
- * @version 28
+ * @version 29
  */
 (function () {
   const LitElement = Object.getPrototypeOf(customElements.get("ha-panel-lovelace"));
@@ -20,6 +20,7 @@
     show_zone_picker: true,
     show_headlights: true,
     map_refresh_seconds: 30,
+    map_size: "auto",
     units: "metric",
   });
 
@@ -101,6 +102,59 @@
     error: "Error",
   };
 
+  function normalizeMapSize(value) {
+    const raw = String(value ?? DEFAULTS.map_size).trim().toLowerCase();
+    if (raw === "compact" || raw === "large" || raw === "full") return raw;
+    return "auto";
+  }
+
+  function resolveMapSize(cfg, activity, showShapePanel) {
+    const mode = normalizeMapSize(cfg.map_size);
+    if (mode !== "auto") return mode;
+    if (isActiveRun(activity)) return showShapePanel ? "large" : "full";
+    if (showShapePanel) return "compact";
+    return "large";
+  }
+
+  /** When to show the side zone schematic and which zones to highlight. */
+  function resolveShapePanelState(cfg, activity, selected, mowAll, mowingZones, mowingAll, zoneFeatures) {
+    if (cfg.show_zone_picker === false || !zoneFeatures?.length) {
+      return { show: false, highlight: new Set(), label: "" };
+    }
+    const picking = !isActiveRun(activity) && selected.size > 0;
+    if (picking) {
+      return {
+        show: true,
+        highlight: selected,
+        label: selected.size === 1 ? "1 zone" : `${selected.size} zones`,
+      };
+    }
+    if (!isActiveRun(activity)) {
+      return { show: false, highlight: new Set(), label: "" };
+    }
+    if (mowingAll) {
+      const all = new Set(zoneFeatures.map((z) => z.id));
+      return { show: all.size > 0, highlight: all, label: "Mowing · all" };
+    }
+    if (mowingZones?.size) {
+      const n = mowingZones.size;
+      return {
+        show: true,
+        highlight: mowingZones,
+        label: n === 1 ? "Mowing · 1 zone" : `Mowing · ${n} zones`,
+      };
+    }
+    if (selected.size > 0) {
+      const n = selected.size;
+      return {
+        show: true,
+        highlight: selected,
+        label: n === 1 ? "Mowing · 1 zone" : `Mowing · ${n} zones`,
+      };
+    }
+    return { show: false, highlight: new Set(), label: "" };
+  }
+
   function mergeConfig(config) {
     const c = { ...DEFAULTS, ...(config || {}) };
     // UI editor saves empty strings — do not wipe bundled default paths.
@@ -109,6 +163,7 @@
     c.hero_mode = normalizeHeroMode(c.hero_mode);
     c.units = normalizeUnits(c.units);
     c.show_map = cfgBool(c.show_map, DEFAULTS.show_map);
+    c.map_size = normalizeMapSize(c.map_size);
     return c;
   }
 
@@ -1249,6 +1304,9 @@
         _artFailedSrc: { state: null },
         _selectedZones: { state: true },
         _mowAllZones: { state: true },
+        _mowingZoneIds: { state: true },
+        _mowingAllZones: { state: true },
+        _mapZoomOpen: { state: false },
       };
     }
 
@@ -1282,6 +1340,8 @@
       this.config = mergeConfig(config);
       this._selectedZones = this._selectedZones || new Set();
       this._mowAllZones = this._mowAllZones || false;
+      this._mowingZoneIds = this._mowingZoneIds || new Set();
+      this._mowingAllZones = this._mowingAllZones || false;
     }
 
     _zoneList(cfg, entities) {
@@ -1303,6 +1363,31 @@
     _selectedZoneSet() {
       if (!this._selectedZones) this._selectedZones = new Set();
       return this._selectedZones;
+    }
+
+    _mowingZoneSet() {
+      if (!this._mowingZoneIds) this._mowingZoneIds = new Set();
+      return this._mowingZoneIds;
+    }
+
+    _syncMowingZoneState(activity) {
+      if (isActiveRun(activity)) return;
+      if (this._mowingZoneSet().size || this._mowingAllZones) {
+        this._mowingZoneIds = new Set();
+        this._mowingAllZones = false;
+      }
+    }
+
+    _shapePanelState(cfg, entities, activity, zoneFeatures) {
+      return resolveShapePanelState(
+        cfg,
+        activity,
+        this._selectedZoneSet(),
+        this._mowAllZones,
+        this._mowingZoneSet(),
+        this._mowingAllZones,
+        zoneFeatures
+      );
     }
 
     _toggleZone(zoneId) {
@@ -1363,10 +1448,16 @@
       if (
         changed.has("hass") ||
         changed.has("_selectedZones") ||
+        changed.has("_mowingZoneIds") ||
+        changed.has("_mowingAllZones") ||
         changed.has("_mapTick") ||
         changed.has("config")
       ) {
         this._scheduleZoneShapePaint();
+      }
+      if (changed.has("hass")) {
+        const entities = resolveEntities(this.hass, mergeConfig(this.config));
+        this._syncMowingZoneState(mowerActivity(this.hass, entities));
       }
     }
 
@@ -1382,14 +1473,14 @@
       const canvas = this.shadowRoot?.querySelector("canvas.zone-shape-canvas");
       if (!canvas || !this.hass) return;
       const cfg = mergeConfig(this.config);
-      const selected = this._selectedZoneSet();
-      if (cfg.show_zone_picker === false || !selected.size) return;
       const entities = resolveEntities(this.hass, cfg);
+      const activity = mowerActivity(this.hass, entities);
       const { zones } = this._zoneFeatureData(cfg, entities);
-      if (!zones.length) return;
+      const panel = this._shapePanelState(cfg, entities, activity, zones);
+      if (!panel.show || !panel.highlight.size) return;
       const mapSt = entityState(this.hass, entities.map);
       const renderDebug = mapSt?.attributes?.render_debug || null;
-      paintZoneShapeCanvas(canvas, zones, selected, renderDebug);
+      paintZoneShapeCanvas(canvas, zones, panel.highlight, renderDebug);
     }
 
     _startMapTimer() {
@@ -1455,8 +1546,12 @@
           };
           if (cfg.device) payload.device_id = cfg.device;
           await this._call("lymow", "start_zones", payload);
+          this._mowingZoneIds = new Set(selected);
+          this._mowingAllZones = false;
         } else {
           await this._call("lawn_mower", "start_mowing", { entity_id: entities.mower });
+          this._mowingZoneIds = new Set();
+          this._mowingAllZones = true;
         }
       } finally {
         this._busy = false;
@@ -1734,15 +1829,50 @@
       `;
     }
 
-    _renderZoneShapePanel(selected) {
-      if (!selected?.size) return nothing;
-      const count = selected.size;
+    _renderZoneShapePanel(label) {
+      if (!label) return nothing;
       return html`
-        <div class="zone-shape-panel" data-card-version="28" aria-label="Zone shapes">
-          <div class="zone-shape-label">${count === 1 ? "1 zone" : `${count} zones`}</div>
+        <div class="zone-shape-panel" data-card-version="29" aria-label="Zone shapes">
+          <div class="zone-shape-label">${label}</div>
           <canvas class="zone-shape-canvas"></canvas>
         </div>
       `;
+    }
+
+    _renderMapZoomOverlay(entities) {
+      if (!this._mapZoomOpen || !entities.map) return nothing;
+      const st = entityState(this.hass, entities.map);
+      const token = st?.attributes?.access_token || "";
+      const src = cameraProxyUrl(this.hass, entities.map, token);
+      void this._mapTick;
+      return html`
+        <div
+          class="map-zoom-backdrop"
+          role="dialog"
+          aria-label="Enlarged map"
+          @click=${() => {
+            this._mapZoomOpen = false;
+          }}
+        >
+          <div class="map-zoom-dialog" @click=${(ev) => ev.stopPropagation()}>
+            <button
+              type="button"
+              class="map-zoom-close"
+              aria-label="Close"
+              @click=${() => {
+                this._mapZoomOpen = false;
+              }}
+            >
+              ×
+            </button>
+            <img src=${src} alt="Lymow map enlarged" draggable="false" />
+          </div>
+        </div>
+      `;
+    }
+
+    _openMapZoom() {
+      this._mapZoomOpen = true;
     }
 
     _renderGeoJsonHero(zoneFeatures, selected, phase, projection) {
@@ -1787,26 +1917,32 @@
       `;
     }
 
-    _renderMapHero(entities, phase, zoneFeatures, selected, showShapePanel) {
+    _renderMapHero(entities, phase, mapSize, shapePanel) {
       const st = entityState(this.hass, entities.map);
       const token = st?.attributes?.access_token || "";
       const src = cameraProxyUrl(this.hass, entities.map, token);
       void this._mapTick;
+      const showShapePanel = shapePanel?.show;
       return html`
-        <div class="hero map-hero ${phase}">
+        <div class="hero map-hero map-size-${mapSize} ${phase}">
           <div class="map-stack ${showShapePanel ? "with-shapes" : ""}">
             <div class="map-frame-wrap">
-              <div class="map-frame">
+              <div
+                class="map-frame zoomable"
+                title="Tap to enlarge map"
+                @click=${() => this._openMapZoom()}
+              >
                 <img
                   src=${src}
                   alt="Lymow map"
                   draggable="false"
                   @error=${this._onMapError}
                 />
+                <span class="map-zoom-hint">Tap to enlarge</span>
               </div>
               <div class="map-badge">Live map</div>
             </div>
-            ${showShapePanel ? this._renderZoneShapePanel(selected) : nothing}
+            ${showShapePanel ? this._renderZoneShapePanel(shapePanel.label) : nothing}
           </div>
         </div>
       `;
@@ -1822,19 +1958,21 @@
       const img = heroArtPath(cfg, activity);
       const artSrc = mediaUrl(this.hass, img);
       const selected = this._selectedZoneSet();
-      const { zones: zoneFeatures } = this._zoneFeatureData(cfg, entities);
+      const { zones: zoneFeatures, overlayProjection } = this._zoneFeatureData(cfg, entities);
+      const shapePanel = this._shapePanelState(cfg, entities, activity, zoneFeatures);
       const zonePickActive = cfg.show_zone_picker !== false && selected.size > 0;
-      const showShapePanel = zonePickActive && zoneFeatures.length > 0;
+      const showShapePanel = shapePanel.show;
+      const mapSize = resolveMapSize(cfg, activity, showShapePanel);
       const artFailed = Boolean(artSrc && this._artFailedSrc === artSrc);
 
       const useLiveMap =
         entities.map &&
-        (mapOn || zonePickActive || mode === "map" || artFailed) &&
-        (mode !== "art" || zonePickActive) &&
-        (mode === "map" || zonePickActive || !this._mapFailed);
+        (mapOn || zonePickActive || showShapePanel || mode === "map" || artFailed) &&
+        (mode !== "art" || zonePickActive || showShapePanel) &&
+        (mode === "map" || zonePickActive || showShapePanel || !this._mapFailed);
 
       if (useLiveMap) {
-        return this._renderMapHero(entities, phase, zoneFeatures, selected, showShapePanel);
+        return this._renderMapHero(entities, phase, mapSize, shapePanel);
       }
 
       if (artOn && artSrc && !artFailed) {
@@ -1954,6 +2092,7 @@
             </div>
 
             ${this._renderHero(cfg, entities, activity, phase)}
+            ${this._renderMapZoomOverlay(entities)}
 
             <div class="status-row">
               <div class="state-pill ${phase}">
@@ -2216,6 +2355,92 @@
           height: 100%;
           object-fit: contain;
           border-radius: 8px;
+        }
+        .map-frame.zoomable {
+          cursor: zoom-in;
+        }
+        .map-zoom-hint {
+          position: absolute;
+          right: 6px;
+          top: 6px;
+          z-index: 2;
+          font-size: 0.55rem;
+          font-weight: 600;
+          color: rgba(255, 255, 255, 0.85);
+          background: rgba(0, 0, 0, 0.55);
+          padding: 2px 6px;
+          border-radius: 999px;
+          pointer-events: none;
+          opacity: 0;
+          transition: opacity 0.15s ease;
+        }
+        .map-frame.zoomable:hover .map-zoom-hint,
+        .map-frame.zoomable:focus-within .map-zoom-hint {
+          opacity: 1;
+        }
+        .map-hero.map-size-large .map-frame {
+          width: min(100%, 240px);
+          max-height: 240px;
+        }
+        .map-hero.map-size-large .map-stack.with-shapes {
+          max-width: 520px;
+        }
+        .map-hero.map-size-large .map-stack.with-shapes .map-frame-wrap,
+        .map-hero.map-size-large .zone-shape-panel {
+          width: min(48%, 240px);
+        }
+        .map-hero.map-size-full .map-stack {
+          max-width: 100%;
+        }
+        .map-hero.map-size-full .map-frame {
+          width: min(100%, 320px);
+          max-height: 320px;
+        }
+        .map-hero.map-size-full {
+          min-height: 200px;
+        }
+        .map-hero.map-size-large:not(.with-shapes) {
+          min-height: 180px;
+        }
+        .map-zoom-backdrop {
+          position: fixed;
+          inset: 0;
+          z-index: 9999;
+          background: rgba(0, 0, 0, 0.82);
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          padding: 16px;
+        }
+        .map-zoom-dialog {
+          position: relative;
+          max-width: min(96vw, 720px);
+          max-height: 96vh;
+          width: 100%;
+        }
+        .map-zoom-dialog img {
+          display: block;
+          width: 100%;
+          max-height: 96vh;
+          object-fit: contain;
+          border-radius: 12px;
+          background: #0f172a;
+        }
+        .map-zoom-close {
+          position: absolute;
+          top: -10px;
+          right: -10px;
+          z-index: 1;
+          width: 34px;
+          height: 34px;
+          border: none;
+          border-radius: 50%;
+          background: rgba(15, 23, 42, 0.95);
+          color: #fff;
+          font-size: 1.4rem;
+          line-height: 1;
+          cursor: pointer;
+          box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
         }
         .zone-shape-panel {
           position: relative;
@@ -2602,6 +2827,7 @@
               ...value,
               hero_mode: normalizeHeroMode(value.hero_mode),
               units: normalizeUnits(value.units),
+              map_size: normalizeMapSize(value.map_size),
             },
           },
         })
@@ -2662,6 +2888,19 @@
               },
             },
             { name: "show_map", selector: { boolean: {} } },
+            {
+              name: "map_size",
+              selector: {
+                select: {
+                  options: [
+                    { value: "auto", label: "Auto (larger while mowing, tap to zoom)" },
+                    { value: "compact", label: "Compact" },
+                    { value: "large", label: "Large" },
+                    { value: "full", label: "Full width" },
+                  ],
+                },
+              },
+            },
             { name: "show_stats", selector: { boolean: {} } },
             { name: "show_mow_mode", selector: { boolean: {} } },
             { name: "show_zone_picker", selector: { boolean: {} } },
@@ -2697,6 +2936,7 @@
               hero_mode: "Hero area layout",
               units: "Units for area and blade height",
               show_map: "Auto mode only — show map while mowing",
+              map_size: "Live map size (auto enlarges while mowing)",
               show_stats: "Show stats row (area, height, RTK)",
               show_mow_mode: "Show mow pattern selector",
               show_zone_picker: "Show zone picker (Start selected zones)",
