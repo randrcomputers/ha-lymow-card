@@ -1,7 +1,7 @@
 /**
  * Lymow Card — Home Assistant Lovelace (Lymow-HA integration).
  * Tailored dashboard card for Lymow One Plus and other Lymow mowers.
- * @version 31
+ * @version 32
  */
 (function () {
   const LitElement = Object.getPrototypeOf(customElements.get("ha-panel-lovelace"));
@@ -1990,9 +1990,9 @@
       return html`
         <div
           class="zone-shape-panel"
-          data-card-version="31"
+          data-card-version="32"
           aria-label="Zone shapes"
-          style="width: min(48%, ${shapePx}); height: ${shapePx}; max-width: 100%;"
+          style="width: min(100%, ${shapePx}); aspect-ratio: 1;"
         >
           <div class="zone-shape-label">${label}</div>
           <canvas class="zone-shape-canvas"></canvas>
@@ -2089,19 +2089,17 @@
       const mapPx = `${tokens.map}px`;
       const shapePx = `${tokens.shape}px`;
       const stackPx = tokens.stack >= 9999 ? "100%" : `${tokens.stack}px`;
+      const wrapWidth =
+        showShapePanel && !stackColumn ? `min(48%, ${shapePx})` : `min(100%, ${mapPx})`;
       return html`
         <div class="hero map-hero map-size-${mapSize} ${phase}">
           <div
             class="map-stack ${showShapePanel ? "with-shapes" : ""} ${stackColumn ? "stack-column" : ""}"
             style="max-width: ${stackPx};"
           >
-            <div
-              class="map-frame-wrap"
-              style=${showShapePanel && !stackColumn ? `width: min(48%, ${shapePx});` : `width: min(100%, ${mapPx});`}
-            >
+            <div class="map-frame-wrap" style="width: ${wrapWidth};">
               <div
                 class="map-frame zoomable"
-                style="width: ${mapPx}; height: ${mapPx}; max-width: 100%;"
                 title="Tap to enlarge map"
                 @click=${() => this._openMapZoom()}
               >
@@ -2505,6 +2503,7 @@
         .map-frame-wrap {
           position: relative;
           flex: 0 0 auto;
+          max-width: 100%;
         }
         .map-frame-wrap .map-badge {
           position: absolute;
@@ -2514,8 +2513,11 @@
         }
         .map-frame {
           position: relative;
+          width: 100%;
           aspect-ratio: 1;
           box-sizing: border-box;
+          overflow: hidden;
+          border-radius: 8px;
         }
         .map-frame img {
           display: block;
@@ -2523,19 +2525,17 @@
           height: 100%;
           max-height: none;
           object-fit: contain;
+          object-position: center;
           border-radius: 8px;
         }
-        .map-hero.map-size-compact .map-frame {
-          width: 110px !important;
-          height: 110px !important;
+        .map-hero.map-size-compact .map-frame-wrap {
+          width: min(100%, 110px);
         }
-        .map-hero.map-size-large .map-frame {
-          width: 300px !important;
-          height: 300px !important;
+        .map-hero.map-size-large .map-frame-wrap {
+          width: min(100%, 300px);
         }
-        .map-hero.map-size-full .map-frame {
-          width: min(100%, 420px) !important;
-          height: min(100%, 420px) !important;
+        .map-hero.map-size-full .map-frame-wrap {
+          width: min(100%, 420px);
         }
         .map-frame.zoomable {
           cursor: zoom-in;
