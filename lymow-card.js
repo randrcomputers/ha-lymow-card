@@ -1,7 +1,7 @@
 /**
  * Lymow Card — Home Assistant Lovelace (Lymow-HA integration).
  * Tailored dashboard card for Lymow One Plus and other Lymow mowers.
- * @version 30
+ * @version 31
  */
 (function () {
   const LitElement = Object.getPrototypeOf(customElements.get("ha-panel-lovelace"));
@@ -117,9 +117,9 @@
   }
 
   const MAP_LAYOUT = {
-    compact: { map: 120, stack: 260, shape: 120, column: false },
-    large: { map: 280, stack: 580, shape: 280, column: false },
-    full: { map: 400, stack: 720, shape: 400, column: true },
+    compact: { map: 110, stack: 240, shape: 110, column: false },
+    large: { map: 300, stack: 620, shape: 300, column: false },
+    full: { map: 420, stack: 9999, shape: 420, column: true },
   };
 
   function mapLayoutTokens(mapSize) {
@@ -132,44 +132,78 @@
     return `${MOW_ZONES_STORAGE}:${mowerEntityId || "unknown"}`;
   }
 
-  function saveActiveMowZones(mowerEntityId, zoneIds, allZones) {
-    if (!mowerEntityId) return;
-    try {
-      localStorage.setItem(
-        mowZonesStorageKey(mowerEntityId),
-        JSON.stringify({
-          zoneIds: [...zoneIds],
-          allZones: !!allZones,
-          savedAt: Date.now(),
-        })
-      );
-    } catch {
-      /* private mode / quota */
+  function isActiveRun(activity) {
+    return activity === "mowing" || activity === "returning" || activity === "paused";
+  }
+
+  /** Only wipe persisted mow zones when the session has clearly ended. */
+  function mowingSessionEnded(hass, entities, activity) {
+    if (isActiveRun(activity)) return false;
+    const mowerState = String(entityState(hass, entities.mower)?.state || "").toLowerCase();
+    if (["mowing", "paused", "returning", "docking"].includes(mowerState)) return false;
+    const status = textState(hass, entities.status, "").toLowerCase();
+    if (/mowing|paused|returning|docking/.test(status)) return false;
+    if (isOn(hass, entities.mowing)) return false;
+    if (activity === "unknown") return false;
+    return (
+      activity === "docked" ||
+      activity === "error" ||
+      mowerState === "docked" ||
+      mowerState === "charging" ||
+      mowerState === "idle" ||
+      isOn(hass, entities.charging)
+    );
+  }
+
+  function mowStorageKeys(hass, cfg, entities) {
+    const keys = [];
+    if (entities?.mower) keys.push(entities.mower);
+    if (cfg?.entity_mower && !keys.includes(cfg.entity_mower)) keys.push(cfg.entity_mower);
+    if (cfg?.device) keys.push(`device:${cfg.device}`);
+    if (!keys.length) keys.push("unknown");
+    return keys;
+  }
+
+  function saveActiveMowZones(hass, cfg, entities, zoneIds, allZones) {
+    const payload = JSON.stringify({
+      zoneIds: [...zoneIds],
+      allZones: !!allZones,
+      savedAt: Date.now(),
+    });
+    for (const key of mowStorageKeys(hass, cfg, entities)) {
+      try {
+        localStorage.setItem(mowZonesStorageKey(key), payload);
+      } catch {
+        /* private mode / quota */
+      }
     }
   }
 
-  function loadActiveMowZones(mowerEntityId) {
-    if (!mowerEntityId) return null;
-    try {
-      const raw = localStorage.getItem(mowZonesStorageKey(mowerEntityId));
-      if (!raw) return null;
-      const data = JSON.parse(raw);
-      if (!data || !Array.isArray(data.zoneIds)) return null;
-      return {
-        zoneIds: new Set(data.zoneIds.map(String)),
-        allZones: !!data.allZones,
-      };
-    } catch {
-      return null;
+  function loadActiveMowZones(hass, cfg, entities) {
+    for (const key of mowStorageKeys(hass, cfg, entities)) {
+      try {
+        const raw = localStorage.getItem(mowZonesStorageKey(key));
+        if (!raw) continue;
+        const data = JSON.parse(raw);
+        if (!data || !Array.isArray(data.zoneIds)) continue;
+        return {
+          zoneIds: new Set(data.zoneIds.map(String)),
+          allZones: !!data.allZones,
+        };
+      } catch {
+        /* ignore */
+      }
     }
+    return null;
   }
 
-  function clearActiveMowZones(mowerEntityId) {
-    if (!mowerEntityId) return;
-    try {
-      localStorage.removeItem(mowZonesStorageKey(mowerEntityId));
-    } catch {
-      /* ignore */
+  function clearActiveMowZones(hass, cfg, entities) {
+    for (const key of mowStorageKeys(hass, cfg, entities)) {
+      try {
+        localStorage.removeItem(mowZonesStorageKey(key));
+      } catch {
+        /* ignore */
+      }
     }
   }
 
@@ -680,10 +714,6 @@
   function lymowDeviceTarget(hass, config, entities) {
     const devId = resolveDeviceId(hass, config, entities?.mower);
     return devId ? { device_id: devId } : {};
-  }
-
-  function isActiveRun(activity) {
-    return activity === "mowing" || activity === "returning" || activity === "paused";
   }
 
   function showMapHero(cfg, activity) {
@@ -1457,24 +1487,24 @@
       return this._mowingZoneIds;
     }
 
-    _syncMowingZoneState(activity, mowerEntityId) {
-      if (isActiveRun(activity)) return;
+    _syncMowingZoneState(hass, cfg, entities, activity) {
+      if (!mowingSessionEnded(hass, entities, activity)) return;
       if (this._mowingZoneSet().size || this._mowingAllZones) {
         this._mowingZoneIds = new Set();
         this._mowingAllZones = false;
       }
-      clearActiveMowZones(mowerEntityId);
+      clearActiveMowZones(hass, cfg, entities);
     }
 
     _restoreMowingZonesFromStorage(cfg, entities, activity) {
-      if (!entities?.mower || !isActiveRun(activity)) return;
-      if (this._mowingZoneSet().size || this._mowingAllZones) return;
+      if (!isActiveRun(activity)) return false;
+      if (this._mowingZoneSet().size || this._mowingAllZones) return false;
 
-      const saved = loadActiveMowZones(entities.mower);
+      const saved = loadActiveMowZones(this.hass, cfg, entities);
       if (saved) {
         this._mowingZoneIds = new Set(saved.zoneIds);
         this._mowingAllZones = saved.allZones;
-        return;
+        return true;
       }
 
       const zones = this._zoneList(cfg, entities);
@@ -1483,8 +1513,10 @@
       if (inferred) {
         this._mowingZoneIds = new Set(inferred.zoneIds);
         this._mowingAllZones = inferred.allZones;
-        saveActiveMowZones(entities.mower, inferred.zoneIds, inferred.allZones);
+        saveActiveMowZones(this.hass, cfg, entities, inferred.zoneIds, inferred.allZones);
+        return true;
       }
+      return false;
     }
 
     _shapePanelState(cfg, entities, activity, zoneFeatures) {
@@ -1528,7 +1560,10 @@
       if (this.hass && this.config) {
         const cfg = mergeConfig(this.config);
         const entities = resolveEntities(this.hass, cfg);
-        this._restoreMowingZonesFromStorage(cfg, entities, mowerActivity(this.hass, entities));
+        const activity = mowerActivity(this.hass, entities);
+        if (this._restoreMowingZonesFromStorage(cfg, entities, activity)) {
+          this.requestUpdate();
+        }
       }
     }
 
@@ -1573,8 +1608,10 @@
         const cfg = mergeConfig(this.config);
         const entities = resolveEntities(this.hass, cfg);
         const activity = mowerActivity(this.hass, entities);
-        this._restoreMowingZonesFromStorage(cfg, entities, activity);
-        this._syncMowingZoneState(activity, entities.mower);
+        const hadMow = this._mowingZoneSet().size || this._mowingAllZones;
+        const restored = this._restoreMowingZonesFromStorage(cfg, entities, activity);
+        this._syncMowingZoneState(this.hass, cfg, entities, activity);
+        if (restored && !hadMow) this.requestUpdate();
       }
     }
 
@@ -1665,12 +1702,12 @@
           await this._call("lymow", "start_zones", payload);
           this._mowingZoneIds = new Set(selected);
           this._mowingAllZones = false;
-          saveActiveMowZones(entities.mower, selected, false);
+          saveActiveMowZones(this.hass, cfg, entities, selected, false);
         } else {
           await this._call("lawn_mower", "start_mowing", { entity_id: entities.mower });
           this._mowingZoneIds = new Set();
           this._mowingAllZones = true;
-          saveActiveMowZones(entities.mower, [], true);
+          saveActiveMowZones(this.hass, cfg, entities, [], true);
         }
       } finally {
         this._busy = false;
@@ -1948,10 +1985,15 @@
       `;
     }
 
-    _renderZoneShapePanel(label) {
+    _renderZoneShapePanel(label, shapePx) {
       if (!label) return nothing;
       return html`
-        <div class="zone-shape-panel" data-card-version="30" aria-label="Zone shapes">
+        <div
+          class="zone-shape-panel"
+          data-card-version="31"
+          aria-label="Zone shapes"
+          style="width: min(48%, ${shapePx}); height: ${shapePx}; max-width: 100%;"
+        >
           <div class="zone-shape-label">${label}</div>
           <canvas class="zone-shape-canvas"></canvas>
         </div>
@@ -2044,15 +2086,22 @@
       const showShapePanel = shapePanel?.show;
       const tokens = mapLayoutTokens(mapSize);
       const stackColumn = showShapePanel && tokens.column;
+      const mapPx = `${tokens.map}px`;
+      const shapePx = `${tokens.shape}px`;
+      const stackPx = tokens.stack >= 9999 ? "100%" : `${tokens.stack}px`;
       return html`
-        <div
-          class="hero map-hero map-size-${mapSize} ${phase}"
-          style="--map-size-px: ${tokens.map}px; --map-stack-max-px: ${tokens.stack}px; --shape-size-px: ${tokens.shape}px;"
-        >
-          <div class="map-stack ${showShapePanel ? "with-shapes" : ""} ${stackColumn ? "stack-column" : ""}">
-            <div class="map-frame-wrap">
+        <div class="hero map-hero map-size-${mapSize} ${phase}">
+          <div
+            class="map-stack ${showShapePanel ? "with-shapes" : ""} ${stackColumn ? "stack-column" : ""}"
+            style="max-width: ${stackPx};"
+          >
+            <div
+              class="map-frame-wrap"
+              style=${showShapePanel && !stackColumn ? `width: min(48%, ${shapePx});` : `width: min(100%, ${mapPx});`}
+            >
               <div
                 class="map-frame zoomable"
+                style="width: ${mapPx}; height: ${mapPx}; max-width: 100%;"
                 title="Tap to enlarge map"
                 @click=${() => this._openMapZoom()}
               >
@@ -2066,7 +2115,7 @@
               </div>
               <div class="map-badge">Live map</div>
             </div>
-            ${showShapePanel ? this._renderZoneShapePanel(shapePanel.label) : nothing}
+            ${showShapePanel ? this._renderZoneShapePanel(shapePanel.label, shapePx) : nothing}
           </div>
         </div>
       `;
@@ -2423,7 +2472,7 @@
           align-items: center;
           justify-content: center;
         }
-        .hero img {
+        .art-hero img {
           width: 100%;
           max-height: 160px;
           object-fit: contain;
@@ -2437,9 +2486,6 @@
           display: flex;
           flex-direction: column;
           align-items: center;
-          --map-size-px: 160px;
-          --map-stack-max-px: 340px;
-          --shape-size-px: 150px;
         }
         .map-stack {
           display: flex;
@@ -2450,7 +2496,6 @@
           flex-direction: row;
           align-items: flex-start;
           gap: 10px;
-          max-width: min(100%, var(--map-stack-max-px));
           margin: 0 auto;
         }
         .map-stack.with-shapes.stack-column {
@@ -2467,28 +2512,30 @@
           bottom: 8px;
           z-index: 2;
         }
-        .map-stack.with-shapes .map-frame-wrap {
-          width: min(48%, var(--shape-size-px));
-        }
-        .map-stack.with-shapes.stack-column .map-frame-wrap {
-          width: min(100%, var(--map-size-px));
-        }
         .map-frame {
           position: relative;
-          width: min(100%, var(--map-size-px));
           aspect-ratio: 1;
-          max-height: var(--map-size-px);
-        }
-        .map-stack.with-shapes .map-frame {
-          width: 100%;
-          max-height: var(--map-size-px);
+          box-sizing: border-box;
         }
         .map-frame img {
           display: block;
           width: 100%;
           height: 100%;
+          max-height: none;
           object-fit: contain;
           border-radius: 8px;
+        }
+        .map-hero.map-size-compact .map-frame {
+          width: 110px !important;
+          height: 110px !important;
+        }
+        .map-hero.map-size-large .map-frame {
+          width: 300px !important;
+          height: 300px !important;
+        }
+        .map-hero.map-size-full .map-frame {
+          width: min(100%, 420px) !important;
+          height: min(100%, 420px) !important;
         }
         .map-frame.zoomable {
           cursor: zoom-in;
@@ -2561,7 +2608,6 @@
         .zone-shape-panel {
           position: relative;
           flex: 0 0 auto;
-          width: min(48%, var(--shape-size-px, 150px));
           aspect-ratio: 1;
           border-radius: 8px;
           background: #0f172a;
@@ -2569,9 +2615,7 @@
           display: flex;
           flex-direction: column;
           overflow: hidden;
-        }
-        .map-stack.with-shapes.stack-column .zone-shape-panel {
-          width: min(100%, var(--shape-size-px, 150px));
+          box-sizing: border-box;
         }
         .zone-shape-panel canvas.zone-shape-canvas {
           display: block;
