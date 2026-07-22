@@ -1,7 +1,7 @@
 /**
  * Lymow Card — Home Assistant Lovelace (Lymow-HA integration).
  * Tailored dashboard card for Lymow One Plus and other Lymow mowers.
- * @version 32
+ * @version 33
  */
 (function () {
   const LitElement = Object.getPrototypeOf(customElements.get("ha-panel-lovelace"));
@@ -108,10 +108,10 @@
     return "auto";
   }
 
-  function resolveMapSize(cfg, activity, showShapePanel) {
+  function resolveMapSize(cfg, activity, showShapePanel, sessionActive) {
     const mode = normalizeMapSize(cfg.map_size);
     if (mode !== "auto") return mode;
-    if (isActiveRun(activity)) return showShapePanel ? "large" : "full";
+    if (sessionActive || isActiveRun(activity)) return showShapePanel ? "large" : "full";
     if (showShapePanel) return "compact";
     return "large";
   }
@@ -136,22 +136,58 @@
     return activity === "mowing" || activity === "returning" || activity === "paused";
   }
 
-  /** Only wipe persisted mow zones when the session has clearly ended. */
-  function mowingSessionEnded(hass, entities, activity) {
-    if (isActiveRun(activity)) return false;
+  function sessionProgress(hass, entities) {
+    const pct = numState(hass, entities.progress);
+    return Number.isFinite(pct) ? pct : null;
+  }
+
+  /** Mow job still in progress (including mid-mow recharge on dock). */
+  function hasActiveMowSession(hass, entities, activity, mowingZones, mowingAll) {
+    if (isActiveRun(activity)) return true;
+    if (mowingZones?.size || mowingAll) return true;
+
+    const progress = sessionProgress(hass, entities);
+    if (progress == null || progress <= 0 || progress >= 100) return false;
+
     const mowerState = String(entityState(hass, entities.mower)?.state || "").toLowerCase();
-    if (["mowing", "paused", "returning", "docking"].includes(mowerState)) return false;
     const status = textState(hass, entities.status, "").toLowerCase();
-    if (/mowing|paused|returning|docking/.test(status)) return false;
+    const charging = isOn(hass, entities.charging) || mowerState === "charging";
+
+    if (charging) return true;
+    if (/pause dock|resum|charg|waiting to resume|waiting/i.test(status)) return true;
+    if (mowerState === "docked" && /pause|wait|charg|resum|mow/i.test(status)) return true;
+    if (mowerState === "paused") return true;
+
+    return false;
+  }
+
+  function isMidMowRecharge(hass, entities, activity) {
+    if (isActiveRun(activity)) return false;
+    const progress = sessionProgress(hass, entities);
+    if (progress == null || progress <= 0 || progress >= 100) return false;
+    const mowerState = String(entityState(hass, entities.mower)?.state || "").toLowerCase();
+    const charging = isOn(hass, entities.charging) || mowerState === "charging";
+    const status = textState(hass, entities.status, "").toLowerCase();
+    return charging || /pause dock|charg/i.test(status);
+  }
+
+  /** Only wipe persisted mow zones when the session has clearly ended. */
+  function mowingSessionEnded(hass, entities, activity, mowingZones, mowingAll) {
+    if (isActiveRun(activity)) return false;
+    if (hasActiveMowSession(hass, entities, activity, mowingZones, mowingAll)) return false;
+
+    const mowerState = String(entityState(hass, entities.mower)?.state || "").toLowerCase();
+    const status = textState(hass, entities.status, "").toLowerCase();
+    if (["mowing", "paused", "returning", "docking"].includes(mowerState)) return false;
+    if (/mowing|paused|returning|docking|pause dock|resum/i.test(status)) return false;
     if (isOn(hass, entities.mowing)) return false;
     if (activity === "unknown") return false;
+
     return (
       activity === "docked" ||
       activity === "error" ||
       mowerState === "docked" ||
-      mowerState === "charging" ||
-      mowerState === "idle" ||
-      isOn(hass, entities.charging)
+      mowerState === "idle"
     );
   }
 
@@ -238,11 +274,22 @@
   }
 
   /** When to show the side zone schematic and which zones to highlight. */
-  function resolveShapePanelState(cfg, activity, selected, mowAll, mowingZones, mowingAll, zoneFeatures) {
+  function resolveShapePanelState(
+    cfg,
+    activity,
+    selected,
+    mowAll,
+    mowingZones,
+    mowingAll,
+    zoneFeatures,
+    hass,
+    entities
+  ) {
     if (cfg.show_zone_picker === false || !zoneFeatures?.length) {
       return { show: false, highlight: new Set(), label: "" };
     }
-    const picking = !isActiveRun(activity) && selected.size > 0;
+    const sessionActive = hasActiveMowSession(hass, entities, activity, mowingZones, mowingAll);
+    const picking = !sessionActive && selected.size > 0;
     if (picking) {
       return {
         show: true,
@@ -250,19 +297,25 @@
         label: selected.size === 1 ? "1 zone" : `${selected.size} zones`,
       };
     }
-    if (!isActiveRun(activity)) {
+    if (!sessionActive) {
       return { show: false, highlight: new Set(), label: "" };
     }
+    const recharge = isMidMowRecharge(hass, entities, activity);
+    const prefix = recharge ? "Recharging · " : "Mowing · ";
     if (mowingAll) {
       const all = new Set(zoneFeatures.map((z) => z.id));
-      return { show: all.size > 0, highlight: all, label: "Mowing · all" };
+      return {
+        show: all.size > 0,
+        highlight: all,
+        label: recharge ? "Recharging · all" : "Mowing · all",
+      };
     }
     if (mowingZones?.size) {
       const n = mowingZones.size;
       return {
         show: true,
         highlight: mowingZones,
-        label: n === 1 ? "Mowing · 1 zone" : `Mowing · ${n} zones`,
+        label: n === 1 ? `${prefix}1 zone` : `${prefix}${n} zones`,
       };
     }
     if (selected.size > 0) {
@@ -270,7 +323,7 @@
       return {
         show: true,
         highlight: selected,
-        label: n === 1 ? "Mowing · 1 zone" : `Mowing · ${n} zones`,
+        label: n === 1 ? `${prefix}1 zone` : `${prefix}${n} zones`,
       };
     }
     return { show: false, highlight: new Set(), label: "" };
@@ -679,7 +732,11 @@
     const charging = isOn(hass, entities.charging);
     const mowerState = String(entityState(hass, entities.mower)?.state || "").toLowerCase();
     const detail = textState(hass, entities.status, "");
+    const progress = sessionProgress(hass, entities);
 
+    if ((charging || mowerState === "charging") && progress != null && progress > 0 && progress < 100) {
+      return "Charging · resumes";
+    }
     if (charging || mowerState === "charging") return "Charging";
     if (mowerState === "docked") return "Docked";
     if (mowerState === "mowing") return "Mowing";
@@ -716,31 +773,39 @@
     return devId ? { device_id: devId } : {};
   }
 
-  function showMapHero(cfg, activity) {
+  function showMapHero(cfg, activity, hass, entities, mowingZones, mowingAll) {
     const mode = normalizeHeroMode(cfg.hero_mode);
     if (mode === "art") return false;
     if (mode === "map") return true;
     if (!cfgBool(cfg.show_map, true)) return false;
-    return isActiveRun(activity);
+    return (
+      isActiveRun(activity) ||
+      hasActiveMowSession(hass, entities, activity, mowingZones, mowingAll)
+    );
   }
 
-  function showArtHero(cfg, activity) {
+  function showArtHero(cfg, activity, hass, entities, mowingZones, mowingAll) {
     const mode = normalizeHeroMode(cfg.hero_mode);
     if (mode === "art") return true;
     if (mode === "map") return false;
-    return !isActiveRun(activity);
+    const sessionActive = hasActiveMowSession(hass, entities, activity, mowingZones, mowingAll);
+    return !isActiveRun(activity) && !sessionActive;
   }
 
   /** Art in auto (docked) and art mode; map mode only if no map camera entity. */
-  function shouldShowArt(cfg, activity, hasMap) {
+  function shouldShowArt(cfg, activity, hasMap, hass, entities, mowingZones, mowingAll) {
     const mode = normalizeHeroMode(cfg.hero_mode);
     if (mode === "art") return true;
     if (mode === "map") return !hasMap;
-    return !isActiveRun(activity);
+    const sessionActive = hasActiveMowSession(hass, entities, activity, mowingZones, mowingAll);
+    return !isActiveRun(activity) && !sessionActive;
   }
 
-  function heroArtPath(cfg, activity) {
-    return isActiveRun(activity) ? cfg.image_mower : cfg.image_dock || cfg.image_mower;
+  function heroArtPath(cfg, activity, hass, entities, mowingZones, mowingAll) {
+    const sessionActive =
+      isActiveRun(activity) ||
+      hasActiveMowSession(hass, entities, activity, mowingZones, mowingAll);
+    return sessionActive ? cfg.image_mower : cfg.image_dock || cfg.image_mower;
   }
 
   function batteryEntityFromMower(mowerEntityId) {
@@ -1488,7 +1553,17 @@
     }
 
     _syncMowingZoneState(hass, cfg, entities, activity) {
-      if (!mowingSessionEnded(hass, entities, activity)) return;
+      if (
+        !mowingSessionEnded(
+          hass,
+          entities,
+          activity,
+          this._mowingZoneSet(),
+          this._mowingAllZones
+        )
+      ) {
+        return;
+      }
       if (this._mowingZoneSet().size || this._mowingAllZones) {
         this._mowingZoneIds = new Set();
         this._mowingAllZones = false;
@@ -1497,7 +1572,14 @@
     }
 
     _restoreMowingZonesFromStorage(cfg, entities, activity) {
-      if (!isActiveRun(activity)) return false;
+      const sessionActive = hasActiveMowSession(
+        this.hass,
+        entities,
+        activity,
+        this._mowingZoneSet(),
+        this._mowingAllZones
+      );
+      if (!sessionActive) return false;
       if (this._mowingZoneSet().size || this._mowingAllZones) return false;
 
       const saved = loadActiveMowZones(this.hass, cfg, entities);
@@ -1527,7 +1609,9 @@
         this._mowAllZones,
         this._mowingZoneSet(),
         this._mowingAllZones,
-        zoneFeatures
+        zoneFeatures,
+        this.hass,
+        entities
       );
     }
 
@@ -1587,7 +1671,16 @@
       if (changed.has("hass") && this._mapFailed) {
         const entities = resolveEntities(this.hass, mergeConfig(this.config));
         const activity = mowerActivity(this.hass, entities);
-        if (!showMapHero(mergeConfig(this.config), activity)) {
+        if (
+          !showMapHero(
+            mergeConfig(this.config),
+            activity,
+            this.hass,
+            entities,
+            this._mowingZoneSet(),
+            this._mowingAllZones
+          )
+        ) {
           this._mapFailed = false;
         }
       }
@@ -1833,9 +1926,10 @@
       `;
     }
 
-    _renderProgress(hass, entities, activity) {
+    _renderProgress(hass, entities, activity, mowingZones, mowingAll) {
       const pct = numState(hass, entities.progress);
-      if (pct == null || (activity !== "mowing" && activity !== "returning" && activity !== "paused")) {
+      const sessionActive = hasActiveMowSession(hass, entities, activity, mowingZones, mowingAll);
+      if (pct == null || !sessionActive) {
         return nothing;
       }
       return html`
@@ -1990,7 +2084,7 @@
       return html`
         <div
           class="zone-shape-panel"
-          data-card-version="32"
+          data-card-version="33"
           aria-label="Zone shapes"
           style="width: min(100%, ${shapePx}); aspect-ratio: 1;"
         >
@@ -2121,19 +2215,36 @@
 
     _renderHero(cfg, entities, activity, phase) {
       const mode = normalizeHeroMode(cfg.hero_mode);
+      const mowingZones = this._mowingZoneSet();
+      const mowingAll = this._mowingAllZones;
+      const sessionActive = hasActiveMowSession(
+        this.hass,
+        entities,
+        activity,
+        mowingZones,
+        mowingAll
+      );
       const mapOn =
-        showMapHero(cfg, activity) &&
+        showMapHero(cfg, activity, this.hass, entities, mowingZones, mowingAll) &&
         entities.map &&
         (mode === "map" || !this._mapFailed);
-      const artOn = shouldShowArt(cfg, activity, Boolean(entities.map));
-      const img = heroArtPath(cfg, activity);
+      const artOn = shouldShowArt(
+        cfg,
+        activity,
+        Boolean(entities.map),
+        this.hass,
+        entities,
+        mowingZones,
+        mowingAll
+      );
+      const img = heroArtPath(cfg, activity, this.hass, entities, mowingZones, mowingAll);
       const artSrc = mediaUrl(this.hass, img);
       const selected = this._selectedZoneSet();
       const { zones: zoneFeatures, overlayProjection } = this._zoneFeatureData(cfg, entities);
       const shapePanel = this._shapePanelState(cfg, entities, activity, zoneFeatures);
       const zonePickActive = cfg.show_zone_picker !== false && selected.size > 0;
       const showShapePanel = shapePanel.show;
-      const mapSize = resolveMapSize(cfg, activity, showShapePanel);
+      const mapSize = resolveMapSize(cfg, activity, showShapePanel, sessionActive);
       const artFailed = Boolean(artSrc && this._artFailedSrc === artSrc);
 
       const useLiveMap =
@@ -2227,6 +2338,16 @@
       const charging = isOn(this.hass, entities.charging);
       const online = isOn(this.hass, entities.online);
       const batt = batteryLevel(this.hass, entities);
+      const mowingZones = this._mowingZoneSet();
+      const mowingAll = this._mowingAllZones;
+      const sessionActive = hasActiveMowSession(
+        this.hass,
+        entities,
+        activity,
+        mowingZones,
+        mowingAll
+      );
+      const midRecharge = isMidMowRecharge(this.hass, entities, activity);
       const statusLabel = displayStatus(this.hass, entities, activity, this._pending, cfg);
       const title =
         cfg.name ||
@@ -2234,15 +2355,20 @@
         "Lymow";
 
       const showPause = canPause(features) && (activity === "mowing" || activity === "returning");
-      const showResume = canStart(features) && activity === "paused";
-      const showStart = canStart(features) && (activity === "docked" || activity === "error" || activity === "unknown");
+      const showResume = canStart(features) && activity === "paused" && !midRecharge;
+      const showStart =
+        canStart(features) &&
+        !sessionActive &&
+        (activity === "docked" || activity === "error" || activity === "unknown");
       const primaryLabel = showPause
         ? "Pause"
         : showResume
           ? "Resume"
-          : this._selectedZoneSet().size > 0
-            ? `Start (${this._selectedZoneSet().size})`
-            : "Start";
+          : midRecharge
+            ? "Recharging…"
+            : this._selectedZoneSet().size > 0
+              ? `Start (${this._selectedZoneSet().size})`
+              : "Start";
       const primaryAction = showPause ? "pause" : "start_mowing";
       const primaryEnabled =
         showPause || showResume || (showStart && this._hasStartSelection(cfg));
@@ -2273,7 +2399,7 @@
             </div>
 
             ${this._renderAlerts(this.hass, entities)}
-            ${this._renderProgress(this.hass, entities, activity)}
+            ${this._renderProgress(this.hass, entities, activity, mowingZones, mowingAll)}
             ${cfg.show_stats ? this._renderStats(this.hass, entities, cfg) : nothing}
 
             ${this._renderZonePicker(cfg, entities, showStart)}
