@@ -1,7 +1,7 @@
 /**
  * Lymow Card — Home Assistant Lovelace (Lymow-HA integration).
  * Tailored dashboard card for Lymow One Plus and other Lymow mowers.
- * @version 33
+ * @version 34
  */
 (function () {
   const LitElement = Object.getPrototypeOf(customElements.get("ha-panel-lovelace"));
@@ -491,6 +491,62 @@
     return manual || merged.battery || findBatteryOnDevice(hass, deviceId);
   }
 
+  function isBladeHeightEntity(uid, name) {
+    const n = String(name || "").toLowerCase();
+    return String(uid || "").endsWith("_blade_height") || /blade height|cut height/i.test(n);
+  }
+
+  function findBladeHeightNumberOnDevice(hass, deviceId) {
+    if (!deviceId) return null;
+    for (const [eid, ent] of Object.entries(hass.entities || {})) {
+      if (ent.device_id !== deviceId) continue;
+      if (entityDomain(eid) !== "number") continue;
+      const st = entityState(hass, eid);
+      const uid = ent.unique_id || "";
+      const name = st?.attributes?.friendly_name || ent.original_name || "";
+      if (!isBladeHeightEntity(uid, name)) continue;
+      return eid;
+    }
+    return null;
+  }
+
+  function bladeHeightFromEntityAttrs(st) {
+    if (!st?.attributes) return null;
+    for (const key of ["cutHeight", "cuttingHeight", "rcCutHeight", "cut_height", "blade_height"]) {
+      if (st.attributes[key] == null) continue;
+      const n = Number(st.attributes[key]);
+      if (Number.isFinite(n) && n > 0) return n;
+    }
+    return null;
+  }
+
+  /** Blade height in mm — sensor, number entity, then attribute fallbacks. */
+  function resolveBladeHeightMm(hass, entities) {
+    const seen = new Set();
+    const candidates = [];
+    for (const eid of [entities.blade, entities.blade_number].filter(Boolean)) {
+      if (seen.has(eid)) continue;
+      seen.add(eid);
+      candidates.push(eid);
+    }
+    if (entities.mower) {
+      const guessed = entityFromMowerSuffix(entities.mower, "_blade_height", "number");
+      if (guessed && !seen.has(guessed)) {
+        seen.add(guessed);
+        candidates.push(guessed);
+      }
+    }
+    for (const eid of candidates) {
+      const n = parseNumericState(hass, eid);
+      if (n != null && n > 0) return n;
+    }
+    for (const eid of [entities.blade, entities.mower, entities.status].filter(Boolean)) {
+      const n = bladeHeightFromEntityAttrs(entityState(hass, eid));
+      if (n != null) return n;
+    }
+    return null;
+  }
+
   function normalizeEntityId(value) {
     if (!value) return null;
     if (typeof value === "string") {
@@ -691,6 +747,12 @@
     merged.mower = manual.mower || found.mower;
     applyMowerSlugFallbacks(hass, merged, merged.mower);
     merged.battery = resolveBatteryEntity(hass, config, merged, devId);
+    merged.blade_number =
+      findBladeHeightNumberOnDevice(hass, devId) ||
+      (merged.mower ? entityFromMowerSuffix(merged.mower, "_blade_height", "number") : null);
+    if (merged.blade_number && !entityExists(hass, merged.blade_number)) {
+      merged.blade_number = null;
+    }
     return merged;
   }
 
@@ -1954,11 +2016,11 @@
       if (areaEntity && areaFormatted) {
         items.push({ label: areaLabel, value: areaFormatted });
       }
-      if (entities.blade) {
-        const blade = textState(hass, entities.blade, "—");
+      if (entities.blade || entities.blade_number) {
+        const bladeMm = resolveBladeHeightMm(hass, entities);
         items.push({
           label: "Height",
-          value: blade === "—" ? blade : formatBladeHeightStat(hass, cfg, blade),
+          value: bladeMm != null ? formatBladeHeightStat(hass, cfg, String(bladeMm)) : "—",
         });
       }
       if (entities.rtk) {
@@ -2084,7 +2146,7 @@
       return html`
         <div
           class="zone-shape-panel"
-          data-card-version="33"
+          data-card-version="34"
           aria-label="Zone shapes"
           style="width: min(100%, ${shapePx}); aspect-ratio: 1;"
         >
