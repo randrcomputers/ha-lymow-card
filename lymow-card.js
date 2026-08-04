@@ -1,7 +1,7 @@
 /**
  * Lymow Card — Home Assistant Lovelace (Lymow-HA integration).
  * Tailored dashboard card for Lymow One Plus and other Lymow mowers.
- * @version 34
+ * @version 35
  */
 (function () {
   const LitElement = Object.getPrototypeOf(customElements.get("ha-panel-lovelace"));
@@ -141,47 +141,81 @@
     return Number.isFinite(pct) ? pct : null;
   }
 
+  /** Lymow idle-on-dock states after a job finishes (work status Waiting / Fully Charged). */
+  function isIdleReadyOnDock(hass, entities, activity) {
+    if (activity !== "docked") return false;
+    const status = textState(hass, entities.status, "").trim();
+    if (/^(waiting|idle|fully charged)$/i.test(status)) return true;
+    const mowerState = String(entityState(hass, entities.mower)?.state || "").toLowerCase();
+    if (
+      (mowerState === "docked" || mowerState === "idle") &&
+      /^(waiting|idle|fully charged)$/i.test(status)
+    ) {
+      return true;
+    }
+    if (
+      entities.mowing &&
+      !isOn(hass, entities.mowing) &&
+      !/mowing|resum|pause dock|docking|return|escap|zone partition/i.test(status)
+    ) {
+      const charging = isOn(hass, entities.charging) || mowerState === "charging";
+      if (charging || mowerState === "docked" || mowerState === "idle") return true;
+    }
+    return false;
+  }
+
   /** Mow job still in progress (including mid-mow recharge on dock). */
   function hasActiveMowSession(hass, entities, activity, mowingZones, mowingAll) {
     if (isActiveRun(activity)) return true;
-    if (mowingZones?.size || mowingAll) return true;
+    if (isIdleReadyOnDock(hass, entities, activity)) return false;
 
     const progress = sessionProgress(hass, entities);
-    if (progress == null || progress <= 0 || progress >= 100) return false;
+    if (progress != null && progress >= 100) return false;
+
+    if (progress == null || progress <= 0) {
+      return isOn(hass, entities.mowing);
+    }
 
     const mowerState = String(entityState(hass, entities.mower)?.state || "").toLowerCase();
     const status = textState(hass, entities.status, "").toLowerCase();
     const charging = isOn(hass, entities.charging) || mowerState === "charging";
 
-    if (charging) return true;
-    if (/pause dock|resum|charg|waiting to resume|waiting/i.test(status)) return true;
-    if (mowerState === "docked" && /pause|wait|charg|resum|mow/i.test(status)) return true;
+    if (isOn(hass, entities.mowing)) return true;
+    if (/mowing|resum|pause dock|escap|zone partition/i.test(status)) return true;
     if (mowerState === "paused") return true;
+    if (charging && /charg|resum|pause dock|recharg/i.test(status)) return true;
+    if (mowerState === "docked" && /pause dock|resum|recharg/i.test(status)) return true;
 
     return false;
   }
 
   function isMidMowRecharge(hass, entities, activity) {
     if (isActiveRun(activity)) return false;
+    if (isIdleReadyOnDock(hass, entities, activity)) return false;
     const progress = sessionProgress(hass, entities);
     if (progress == null || progress <= 0 || progress >= 100) return false;
     const mowerState = String(entityState(hass, entities.mower)?.state || "").toLowerCase();
     const charging = isOn(hass, entities.charging) || mowerState === "charging";
     const status = textState(hass, entities.status, "").toLowerCase();
-    return charging || /pause dock|charg/i.test(status);
+    return charging || /pause dock|charg|recharg/i.test(status);
   }
 
   /** Only wipe persisted mow zones when the session has clearly ended. */
   function mowingSessionEnded(hass, entities, activity, mowingZones, mowingAll) {
     if (isActiveRun(activity)) return false;
     if (hasActiveMowSession(hass, entities, activity, mowingZones, mowingAll)) return false;
+    if (isIdleReadyOnDock(hass, entities, activity)) return true;
 
     const mowerState = String(entityState(hass, entities.mower)?.state || "").toLowerCase();
     const status = textState(hass, entities.status, "").toLowerCase();
     if (["mowing", "paused", "returning", "docking"].includes(mowerState)) return false;
     if (/mowing|paused|returning|docking|pause dock|resum/i.test(status)) return false;
     if (isOn(hass, entities.mowing)) return false;
-    if (activity === "unknown") return false;
+
+    const progress = sessionProgress(hass, entities);
+    if (progress != null && progress >= 100) {
+      return activity === "docked" || mowerState === "docked" || mowerState === "idle";
+    }
 
     return (
       activity === "docked" ||
@@ -2146,7 +2180,7 @@
       return html`
         <div
           class="zone-shape-panel"
-          data-card-version="34"
+          data-card-version="35"
           aria-label="Zone shapes"
           style="width: min(100%, ${shapePx}); aspect-ratio: 1;"
         >
